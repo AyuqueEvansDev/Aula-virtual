@@ -155,6 +155,7 @@ function resetAllData(){
     localStorage.removeItem('eduaula_pwd_resets');
     localStorage.removeItem('eduaula_grade_notifs');
     localStorage.removeItem('eduaula_activity_notifs');
+    localStorage.removeItem('eduaula_deleted_activities');
     localStorage.removeItem('eduaula_last_sync');
   } catch(e){}
   _memStore = null;
@@ -498,25 +499,104 @@ function markAllActivitiesRead(){
   toast(c ? `✅ ${c} avisos marcados como leídos` : 'ℹ️ No tienes avisos pendientes');
   render();
 }
+/* Lápidas de borrado: propagan eliminaciones a dispositivos offline.
+   Sin esto, un dispositivo con caché vieja re-subía la actividad/notif
+   borrada y "resucitaba". Colección `deleted_activities/{activityId}`. */
+const DELETED_ACT_KEY = 'eduaula_deleted_activities';
+function getDeletedActivityIds(){
+  try {
+    const arr = JSON.parse(localStorage.getItem(DELETED_ACT_KEY) || '[]');
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch(e){ return new Set(); }
+}
+function saveDeletedActivityIds(setOrArr){
+  try {
+    const arr = setOrArr instanceof Set ? [...setOrArr] : setOrArr;
+    localStorage.setItem(DELETED_ACT_KEY, JSON.stringify(arr));
+  } catch(e){}
+}
+async function fetchDeletedActivityIds(){
+  const local = getDeletedActivityIds();
+  if(!db) return local;
+  try {
+    const snap = await db.collection('deleted_activities').get();
+    snap.forEach(doc => local.add(doc.id));
+    // Cada doc también puede guardar activityId explícito.
+    snap.forEach(doc => { try { const d = doc.data() || {}; if(d.activityId) local.add(d.activityId); } catch(e){} });
+    saveDeletedActivityIds(local);
+  } catch(e){ console.warn('fetchDeletedIds falló:', e); }
+  return local;
+}
+/* Elimina del caché local los avisos cuya actividad ya no existe o fue
+   borrada. Mantiene intactos los avisos de actividades vigentes. */
+function pruneOrphanActivityNotifs(validActivityIds, deletedIds){
+  try {
+    const local = getActivityNotifs();
+    if(!local.length) return 0;
+    const valid = validActivityIds instanceof Set
+      ? validActivityIds
+      : new Set(store().activities.map(a => a.id));
+    const del = deletedIds instanceof Set ? deletedIds : getDeletedActivityIds();
+    const kept = local.filter(n => {
+      const aid = n.activityId || (n.id || '').replace(/^an_/, '');
+      if(del.has(aid) || del.has(n.id)) return false; // borrada: fuera
+      if(valid.has(aid)) return true; // vigente: se mantiene
+      return false; // huérfana sin actividad: fuera (no revivir)
+    });
+    if(kept.length !== local.length){
+      saveActivityNotifs(kept);
+      return 1;
+    }
+  } catch(e){ console.warn('pruneOrphanActivityNotifs:', e); }
+  return 0;
+}
 async function pullActivityNotifsFromCloud(){
   if(!db) return 0;
+  // 1) Lápidas primero: lo borrado no debe volver.
+  const deleted = await fetchDeletedActivityIds().catch(() => getDeletedActivityIds());
   const snap = await db.collection('activity_notifications').get();
-  if(snap.empty) return 0;
   const local = getActivityNotifs();
-  const byId = new Map(local.map(n => [n.id, n]));
+  const byId = new Map();
+  // 2) La nube manda: parte SOLO de los docs que existen en la nube.
+  // (Antes se partía del caché local y lo borrado nunca salía.)
   snap.forEach(doc => {
     const d = Object.assign({}, doc.data() || {}, { id: doc.id });
-    const cur = byId.get(doc.id);
-    if(!cur){ byId.set(doc.id, d); }
-    else {
-      if(cur.read){ d.read = true; d.readAt = d.readAt || cur.readAt; }
-      byId.set(doc.id, Object.assign({}, cur, d));
-    }
+    const aid = d.activityId || (d.id || '').replace(/^an_/, '');
+    if(deleted.has(aid) || deleted.has(d.id)) return; // borrada: ignorar
+    const cur = local.find(n => n.id === doc.id);
+    if(cur && cur.read){ d.read = true; d.readAt = d.readAt || cur.readAt; }
+    else if(cur){ Object.assign(d, { read: cur.read || false, readAt: cur.readAt || d.readAt || null }); }
+    byId.set(doc.id, d);
   });
-  const merged = [...byId.values()];
-  if(JSON.stringify(merged) === JSON.stringify(local)) return 0;
-  saveActivityNotifs(merged);
-  return 1;
+  // 3) Filtra por actividades vigentes: si la actividad ya no existe en el
+  // caché (fue eliminada y podada del store), su aviso no revive.
+  let merged = [...byId.values()];
+  try {
+    const validActs = new Set(store().activities.map(a => a.id));
+    if(validActs.size){
+      merged = merged.filter(n => {
+        const aid = n.activityId || (n.id || '').replace(/^an_/, '');
+        if(deleted.has(aid)) return false;
+        // Si la actividad existe en el store la conserva; si el store aún
+        // no se sincronizó (vacío en primer arranque) no filtra de más.
+        return true;
+      });
+    }
+  } catch(e){}
+  const changed = JSON.stringify(merged) !== JSON.stringify(local) ? 1 : 0;
+  // 4) Poda huérfanas del caché aunque la nube venga vacía.
+  const pruned = pruneOrphanActivityNotifs(null, deleted);
+  if(changed || pruned){
+    if(changed) saveActivityNotifs(merged);
+    // Si hubo poda y también cambio, merged ya es correcto; si solo poda,
+    // prune ya guardó. Si la nube está vacía y todo era huérfano, limpia.
+    if(snap.empty && getActivityNotifs().length){
+      const valid = new Set(store().activities.map(a => a.id));
+      pruneOrphanActivityNotifs(valid, deleted);
+    }
+    return 1;
+  }
+  return 0;
 }
 /* Docente: crea/actualiza el aviso broadcast al publicar. Se llama
    DESPUÉS de guardar la actividad en Firestore. */
@@ -545,19 +625,25 @@ async function pushActivityBroadcast(activity){
   await cloudSave('activity_notifications', notif.id, sanitizeForFirestore(notif));
 }
 /* Detecta actividad publicada nueva que aún no tiene aviso (respaldo por
-   si el broadcast falló) y genera el aviso local + nube. */
+   si el broadcast falló) y genera el aviso local + nube. NUNCA revive
+   actividades borradas (respeta lápidas). */
 async function detectNewActivityAlert(){
   if(!session || session.rol !== 'estudiante' || !db) return;
   try {
+    const deleted = getDeletedActivityIds();
     const known = new Set(getActivityNotifs().map(n => n.activityId));
     const fresh = store().activities.filter(a =>
-      a.estado === 'publicada' && !known.has(a.id) && canAccessModule(a.curso));
+      a.estado === 'publicada' && !known.has(a.id) && !deleted.has(a.id) && canAccessModule(a.curso));
     for(const a of fresh.slice(0, 5)){
       await pushActivityBroadcastStudentSide(a);
     }
   } catch(e){}
 }
 async function pushActivityBroadcastStudentSide(a){
+  try {
+    if(!a || !a.id) return;
+    if(getDeletedActivityIds().has(a.id)) return; // borrada: no revivir
+  } catch(e){}
   const notif = {
     id: 'an_' + a.id, activityId: a.id, activityTitle: a.titulo || 'Nueva actividad',
     module: a.curso || '', descripcion: (a.descripcion || '').slice(0, 200),
@@ -1118,28 +1204,49 @@ function markFullSync(){
   _lastFullSyncAt = new Date().toISOString();
   try { localStorage.setItem('eduaula_last_sync', _lastFullSyncAt); } catch(e){}
 }
-/* Actividades: la nube manda. Fusiona por id (nube gana) y conserva
-   creaciones locales offline para re-subirlas. */
+/* Actividades: la nube manda. Fusiona por id (nube gana), poda borradas
+   y NO resucita: solo re-sube creaciones offline genuinamente nuevas. */
 async function pullActivitiesFromCloud(){
   if(!db) return 0;
+  const deleted = await fetchDeletedActivityIds().catch(() => getDeletedActivityIds());
   const snap = await db.collection('activities').get();
   const d = store();
-  const byId = new Map(d.activities.map(a => [a.id, a]));
-  let changed = 0;
+  const cloudById = new Map();
   snap.forEach(doc => {
-    const cloud = Object.assign({}, doc.data() || {}, { id: doc.id });
-    const local = byId.get(doc.id);
-    if(!local || JSON.stringify(local) !== JSON.stringify(cloud)){ changed++; }
-    byId.set(doc.id, cloud);
+    if(deleted.has(doc.id)) return; // lápida: ignorar doc zombie
+    cloudById.set(doc.id, Object.assign({}, doc.data() || {}, { id: doc.id }));
   });
-  const cloudIds = new Set(snap.docs.map(x => x.id));
-  // Re-sube creaciones locales offline que la nube aún no tiene.
-  const onlyLocal = [...byId.values()].filter(a => !cloudIds.has(a.id));
-  onlyLocal.forEach(a => { try { cloudSave('activities', a.id, stripHeavy(a)); } catch(e){} });
-  const merged = [...byId.values()];
+  let changed = 0;
+  // Nuevas / actualizadas desde la nube (sobrescriben caché vieja).
+  const nextById = new Map();
+  cloudById.forEach((cloud, id) => {
+    const local = d.activities.find(a => a.id === id);
+    if(!local || JSON.stringify(local) !== JSON.stringify(cloud)) changed++;
+    nextById.set(id, cloud);
+  });
+  // Locales que la nube no trae:
+  const cloudIds = new Set(cloudById.keys());
+  const lastSync = _lastFullSyncAt || '';
+  d.activities.forEach(a => {
+    if(cloudIds.has(a.id) || deleted.has(a.id)) return; // vigente o borrada
+    // ¿Creación offline nueva (posterior a la última sync)? Re-súbela.
+    // ¿Resto viejo que falta en la nube? Fue borrado en otro dispositivo:
+    // NO lo re-subas, depúralo del caché.
+    const created = a.creadoEn || a.actualizadoEn || '';
+    const isFresh = lastSync && created && created >= lastSync;
+    if(isFresh && !deleted.has(a.id)){
+      nextById.set(a.id, a);
+      try { cloudSave('activities', a.id, stripHeavy(a)); } catch(e){}
+    } else {
+      changed++; // se poda del caché (estaba borrada en la nube)
+    }
+  });
+  const merged = [...nextById.values()];
   if(changed || merged.length !== d.activities.length){
     d.activities = merged;
     try { saveStore(d); } catch(e){}
+    // Al podar actividades, podar también sus avisos huérfanos.
+    try { pruneOrphanActivityNotifs(new Set(merged.map(a => a.id)), deleted); } catch(e){}
     return 1;
   }
   return 0;
@@ -1201,7 +1308,9 @@ async function pullSubmissionsFromCloud(){
   }
   return 0;
 }
-/* Sincronización total post-login + botón Actualizar. */
+/* Sincronización total post-login + botón Actualizar.
+   Orden importa: lápidas → actividades → avisos (para podar huérfanas
+   con el store ya actualizado). Las vigentes se mantienen intactas. */
 async function pullAllCloudData(manual){
   if(!session) return;
   if(!db){ if(manual) toast('⚠️ Sin conexión a la nube. Revisa tu internet.'); return; }
@@ -1210,14 +1319,18 @@ async function pullAllCloudData(manual){
   _lastCloudPull = now;
   if(manual) toast('🔄 Sincronizando con la nube…');
   try {
-    const parts = await Promise.allSettled([
-      pullActivitiesFromCloud(),
-      pullSubmissionsFromCloud(),
-      pullActivityNotifsFromCloud(),
-      pullGradeNotifsFromCloud().catch(()=>0),
-      pullPwdResetsFromCloud().catch(()=>0)
-    ]);
-    const changed = parts.some(p => p.status === 'fulfilled' && p.value);
+    let changed = 0;
+    try { changed += await pullActivitiesFromCloud() ? 1 : 0; } catch(e){ console.warn('pull activities:', e); }
+    try { changed += await pullSubmissionsFromCloud() ? 1 : 0; } catch(e){ console.warn('pull submissions:', e); }
+    try { changed += await pullActivityNotifsFromCloud() ? 1 : 0; } catch(e){ console.warn('pull actNotifs:', e); }
+    try { changed += await pullGradeNotifsFromCloud().catch(()=>0) ? 1 : 0; } catch(e){}
+    try { changed += await pullPwdResetsFromCloud().catch(()=>0) ? 1 : 0; } catch(e){}
+    // Poda final de seguridad: avisos sin actividad vigente no reviven.
+    try {
+      const deleted = getDeletedActivityIds();
+      const valid = new Set(store().activities.map(a => a.id));
+      if(pruneOrphanActivityNotifs(valid, deleted)) changed++;
+    } catch(e){}
     markFullSync();
     _cloudStatus = 'conectado';
     if(changed){ render(); if(manual) toast('✅ Sincronizado con la nube'); }
@@ -1252,6 +1365,24 @@ function subscribeRealtime(){
         if(changed){
           d.activities = [...byId.values()];
           try { saveStore(d); } catch(e){}
+          // Si una actividad se eliminó en otro dispositivo, su aviso no
+          // debe quedarse colgado: pódalo del caché local de inmediato.
+          try {
+            const removedIds = [];
+            snap.docChanges().forEach(ch => { if(ch.type === 'removed') removedIds.push(ch.doc.id); });
+            if(removedIds.length){
+              const del = getDeletedActivityIds();
+              removedIds.forEach(id => del.add(id));
+              saveDeletedActivityIds(del);
+              const before = getActivityNotifs();
+              const kept = before.filter(n => {
+                const aid = n.activityId || (n.id || '').replace(/^an_/, '');
+                return !removedIds.includes(aid) && !removedIds.includes(n.id);
+              });
+              if(kept.length !== before.length) saveActivityNotifs(kept);
+            }
+            pruneOrphanActivityNotifs(new Set(d.activities.map(a => a.id)), getDeletedActivityIds());
+          } catch(e){}
           // Si es estudiante y llegó una actividad nueva publicada, avisa.
           try { detectNewActivityAlert(snap); } catch(e){}
           render();
@@ -1528,6 +1659,36 @@ function navigate(r,p=null){
   document.querySelectorAll('#sideNav button').forEach(b=>b.classList.toggle('active',b.dataset.r===r||(r==='curso'&&b.dataset.r==='cursos')));
   render();
 }
+/* ---------- Sidebar móvil: cerrar al tocar fuera (incluida la zona
+   blanca del contenido principal). No cambia el menú actual: el botón ☰
+   sigue abriendo/cerrando y navegar también cierra. Solo actúa en móvil
+   (<=760px, igual que el CSS) y cuando el sidebar está abierto. */
+(function initSidebarOutsideClose(){
+  function isMobile(){
+    try { return window.matchMedia('(max-width: 760px)').matches; }
+    catch(e){ return window.innerWidth <= 760; }
+  }
+  function closeSidebar(){
+    try { document.getElementById('sidebar')?.classList.remove('open'); } catch(e){}
+  }
+  document.addEventListener('click', function(ev){
+    try {
+      const sb = document.getElementById('sidebar');
+      if(!sb || !sb.classList.contains('open')) return;
+      if(!isMobile()) return;
+      const t = ev.target;
+      // Taps dentro del menú o en el botón ☰ los gestiona el propio menú.
+      if(t && t.closest && (t.closest('#sidebar') || t.closest('.hamburger'))) return;
+      closeSidebar();
+    } catch(e){}
+  });
+  document.addEventListener('keydown', function(ev){
+    if(ev && ev.key === 'Escape'){ try { closeSidebar(); } catch(e){} }
+  });
+  window.addEventListener('resize', function(){
+    try { if(!isMobile()) closeSidebar(); } catch(e){}
+  });
+})();
 let _gsTimer = null;
 function onGlobalSearch(v){
   // Antirrebote: evita un navigate+render completo por cada tecla
@@ -1872,6 +2033,13 @@ async function saveActivity(editId,estado){
   // 1) NUBE PRIMERO (fuente compartida): sin esto el estudiante en otro
   // dispositivo jamás ve la actividad. Se espera la escritura y se avisa si falla.
   obj.actualizadoEn = new Date().toISOString();
+  // Si el docente republica un id que tenía lápida, la intención manda:
+  // se retira la lápida local y en la nube para que no se pode de nuevo.
+  try {
+    const del = getDeletedActivityIds();
+    if(del.has(obj.id)){ del.delete(obj.id); saveDeletedActivityIds(del); }
+    if(db) cloudDelete('deleted_activities', obj.id);
+  } catch(e){}
   let cloudOk = false;
   if(db){
     try {
@@ -1896,22 +2064,56 @@ async function saveActivity(editId,estado){
   }
   toast(estado==='borrador'?'💾 Borrador guardado en '+courseOf(obj.curso).corto:(cloudOk||!db?'🚀 Actividad publicada en '+courseOf(obj.curso).corto+' y notificada a estudiantes':'⚠️ Guardado local; la nube falló — reintenta')); navigate('curso', obj.curso);
 }
-function delActivity(id){
+async function delActivity(id){
   if(!confirm('¿Eliminar esta actividad y sus trabajos?')) return;
-  const d=store();
+  const d = store();
   const act = d.activities.find(a=>a.id===id);
   const subs = d.submissions.filter(s=>s.activityId===id);
-  d.activities=d.activities.filter(a=>a.id!==id); d.submissions=d.submissions.filter(s=>s.activityId!==id); saveStore(d);
-  cloudDelete('activities', id);
-  cloudDelete('activity_notifications', 'an_' + id);
-  subs.forEach(s=>cloudDelete('submissions', s.id));
+  const subIds = new Set(subs.map(s => s.id));
+  // 1) Limpieza local INMEDIATA (actividades, entregas y avisos).
+  d.activities = d.activities.filter(a=>a.id!==id);
+  d.submissions = d.submissions.filter(s=>s.activityId!==id);
+  try { saveStore(d); } catch(e){}
+  try {
+    saveActivityNotifs(getActivityNotifs().filter(n => {
+      const aid = n.activityId || (n.id || '').replace(/^an_/, '');
+      return aid !== id && n.id !== 'an_' + id;
+    }));
+  } catch(e){}
+  try {
+    const garr = getGradeNotifs().filter(n => n.activityId !== id && !subIds.has(n.submissionId));
+    saveGradeNotifs(garr);
+  } catch(e){}
+  try {
+    const del = getDeletedActivityIds(); del.add(id); saveDeletedActivityIds(del);
+  } catch(e){}
+  toast('🗑 Eliminando de la nube…');
+  // 2) Nube: lápida PRIMERO (para que ningún dispositivo la resucite),
+  // luego borrado esperado de actividad + aviso + entregas + notas.
+  try {
+    if(db){
+      try { await cloudSave('deleted_activities', id, sanitizeForFirestore({ activityId: id, deletedAt: new Date().toISOString(), deletedBy: (session && session.email) || '' })); } catch(e){}
+      await Promise.allSettled([
+        cloudDelete('activities', id),
+        cloudDelete('activity_notifications', 'an_' + id),
+        ...subs.map(s => cloudDelete('submissions', s.id))
+      ]);
+      // Notas asociadas a esa actividad (para que no reaparezcan).
+      try {
+        const gsnap = await db.collection('grade_notifications').where('activityId', '==', id).get().catch(() => null);
+        if(gsnap && !gsnap.empty){
+          await Promise.allSettled(gsnap.docs.map(x => cloudDelete('grade_notifications', x.id)));
+        }
+      } catch(e){ console.warn('Limpieza grade_notifs:', e); }
+    }
+  } catch(e){ console.warn('delActivity nube:', e); }
   // Borra archivos de Supabase (mejor esfuerzo, no bloquea)
   try{
     if(act?.materialPath) supaRemove(SUPA_BUCKET, [act.materialPath]);
     const wpaths = subs.map(s=>s.storagePath).filter(Boolean);
     if(wpaths.length) supaRemove(SUPA_BUCKET, wpaths);
   }catch(e){}
-  toast('🗑 Actividad eliminada');
+  toast('🗑 Actividad y sus notificaciones eliminadas');
   if(act && COURSES[act.curso]) navigate('curso', act.curso); else navigate('actividades');
 }
 
@@ -2387,7 +2589,7 @@ function viewConfig(){
       <button class="btn btn-primary btn-sm" onclick="checkFirebaseConnection().then(r=>{toast(r.ok?'✅ Conectado a Firestore':'⚠️ Falló: '+(r.reason||''));render()})">🔌 Probar conexión</button>
       <button class="btn btn-outline btn-sm" onclick="pullAllCloudData(true)">🔄 Sincronizar ahora</button>
     </div>
-    <div class="alert alert-yellow" style="margin:12px 0 0">🔐 Si la prueba dice <b>permission-denied</b>, en Firebase Console → Firestore → Rules permite al menos:<br><code>match /activities/{id} { allow read, write: if request.auth != null; }</code><br><code>match /submissions/{id} { allow read, write: if request.auth != null; }</code><br><code>match /activity_notifications/{id} { allow read, write: if request.auth != null; }</code><br><code>match /grade_notifications/{id} { allow read, write: if request.auth != null; }</code><br><code>match /password_resets/{id} { allow read, write: if request.auth != null; }</code><br><code>match /users/{id} { allow read, write: if request.auth != null; }</code></div>
+    <div class="alert alert-yellow" style="margin:12px 0 0">🔐 Si la prueba dice <b>permission-denied</b>, en Firebase Console → Firestore → Rules permite al menos:<br><code>match /activities/{id} { allow read, write: if request.auth != null; }</code><br><code>match /submissions/{id} { allow read, write: if request.auth != null; }</code><br><code>match /activity_notifications/{id} { allow read, write: if request.auth != null; }</code><br><code>match /grade_notifications/{id} { allow read, write: if request.auth != null; }</code><br><code>match /password_resets/{id} { allow read, write: if request.auth != null; }</code><br><code>match /deleted_activities/{id} { allow read, write: if request.auth != null; }</code><br><code>match /users/{id} { allow read, write: if request.auth != null; }</code></div>
   </div>`;
 }
 function updCfg(k,v){ const d=store(); d.config[k]=v; saveStore(d); toast('✅ Guardado'); }
