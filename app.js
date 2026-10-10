@@ -279,8 +279,16 @@ function myGradeNotifs(){
   if(!session || session.rol !== 'estudiante') return [];
   try { syncGradeNotifsFor(session.email); } catch(e){}
   const mail = (session.email || '').toLowerCase();
+  let deleted = null, valid = null;
+  try { deleted = getDeletedActivityIds(); valid = validActivityIdSet(); } catch(e){}
   return getGradeNotifs()
     .filter(n => (n.studentEmail || '').toLowerCase() === mail)
+    .filter(n => {
+      const aid = n.activityId || '';
+      if(aid && deleted && deleted.has(aid)) return false;
+      if(aid && valid && valid.size && !valid.has(aid)) return false;
+      return true;
+    })
     .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
 }
 function myUnreadGradeNotifs(){
@@ -325,9 +333,14 @@ function syncGradeNotifsFor(email){
   if(!mail) return;
   const subs = store().submissions.filter(s => (s.email||'').toLowerCase()===mail && gradeOf(s)!=null);
   if(!subs.length) return;
+  let deleted = null, valid = null;
+  try { deleted = getDeletedActivityIds(); valid = validActivityIdSet(); } catch(e){}
   let arr = getGradeNotifs();
   let changed = false;
   subs.forEach(s => {
+    // No regenerar avisos de actividades borradas o inexistentes
+    if(s.activityId && deleted && deleted.has(s.activityId)) return;
+    if(s.activityId && valid && valid.size && !valid.has(s.activityId)) return;
     const exists = arr.some(n => n.submissionId === s.id);
     if(!exists){
       const act = store().activities.find(x=>x.id===s.activityId);
@@ -382,35 +395,77 @@ function markAllGradesRead(){
    ============================================================ */
 let _lastNotifPull = 0;
 async function pullGradeNotifsFromCloud(){
-  if(!db || !session || session.rol !== 'estudiante') return 0;
+  if(!db || !session) return 0;
+  const deleted = await fetchDeletedActivityIds().catch(() => getDeletedActivityIds());
+  const isStudent = session.rol === 'estudiante';
   const mail = (session.email || '').toLowerCase();
-  if(!mail) return 0;
-  const snap = await db.collection('grade_notifications').where('studentEmail', '==', mail).get();
-  if(snap.empty) return 0;
+  if(isStudent && !mail) return 0;
+  // Docente: trae el espejo para verlo igual en todo dispositivo y podar
+  // lo obsoleto. Estudiante: solo sus avisos.
+  const snap = isStudent
+    ? await db.collection('grade_notifications').where('studentEmail', '==', mail).get()
+    : await db.collection('grade_notifications').limit(500).get();
   const local = getGradeNotifs();
-  const byId = new Map(local.map(n => [n.id, n]));
+  const byId = new Map();
+  // La nube manda: parte SOLO de los docs existentes (lo borrado sale).
   snap.forEach(doc => {
     const d = Object.assign({}, doc.data() || {}, { id: doc.id });
-    const cur = byId.get(doc.id);
-    if(!cur){ byId.set(doc.id, d); }
-    else {
-      // La lectura local manda: no revivir como "sin leer" lo ya leído
-      if(cur.read){ d.read = true; d.readAt = d.readAt || cur.readAt; }
-      byId.set(doc.id, Object.assign({}, cur, d));
-    }
+    const aid = d.activityId || '';
+    if(aid && deleted.has(aid)) return; // actividad borrada: ignorar
+    const cur = local.find(n => n.id === doc.id);
+    if(cur && cur.read){ d.read = true; d.readAt = d.readAt || cur.readAt; }
+    else if(cur){ d.read = cur.read || false; d.readAt = cur.readAt || d.readAt || null; }
+    byId.set(doc.id, d);
   });
   // Un trabajo = una notificación vigente: conserva la más reciente
   // (evita que una recalificación muestre la nota vieja además de la nueva)
+  const scope = isStudent
+    ? [...byId.values()].filter(n => (n.studentEmail || '').toLowerCase() === mail)
+    : [...byId.values()];
   const best = new Map();
-  [...byId.values()]
-    .filter(n => (n.studentEmail || '').toLowerCase() === mail)
-    .forEach(n => {
-      const k = n.submissionId || n.id;
-      const prev = best.get(k);
-      if(!prev || (n.createdAt || '') >= (prev.createdAt || '')) best.set(k, n);
-    });
-  const others = [...byId.values()].filter(n => (n.studentEmail || '').toLowerCase() !== mail);
-  const merged = [...others, ...best.values()];
+  scope.forEach(n => {
+    const k = n.submissionId || n.id;
+    const prev = best.get(k);
+    if(!prev || (n.createdAt || '') >= (prev.createdAt || '')) best.set(k, n);
+  });
+  const others = isStudent ? [] : [...byId.values()].filter(n => !best.has(n.submissionId || n.id));
+  let merged = [...best.values(), ...others];
+  // Poda huérfanas por actividad (borradas o inexistentes con store fresco).
+  try {
+    const valid = validActivityIdSet();
+    if(valid.size){
+      merged = merged.filter(n => {
+        const aid = n.activityId || '';
+        if(aid && deleted.has(aid)) return false;
+        if(aid && valid.has(aid)) return true;
+        if(!aid){
+          // Legacy sin activityId: fuera si su entrega ya no existe
+          try {
+            const subIds = new Set(store().submissions.map(s => s.id));
+            if(n.submissionId && subIds.size && !subIds.has(n.submissionId)) return false;
+          } catch(e){}
+          return true;
+        }
+        return false;
+      });
+    } else {
+      merged = merged.filter(n => !(n.activityId && deleted.has(n.activityId)));
+    }
+  } catch(e){}
+  // Mantiene avisos locales de OTROS estudiantes (fuera del alcance docente
+  // limitado) solo si su actividad sigue vigente.
+  if(!isStudent){
+    try {
+      const inScope = new Set(merged.map(n => n.id));
+      const valid = validActivityIdSet();
+      local.forEach(n => {
+        if(inScope.has(n.id)) return;
+        const aid = n.activityId || '';
+        if(aid && (deleted.has(aid) || (valid.size && !valid.has(aid)))) return;
+        merged.push(n);
+      });
+    } catch(e){}
+  }
   if(JSON.stringify(merged) === JSON.stringify(local)) return 0;
   saveGradeNotifs(merged);
   return 1;
@@ -475,8 +530,16 @@ function saveActivityNotifs(arr){
 }
 function myActivityNotifs(){
   if(!session || session.rol !== 'estudiante') return [];
+  let deleted = null, valid = null;
+  try { deleted = getDeletedActivityIds(); valid = validActivityIdSet(); } catch(e){}
   return getActivityNotifs()
     .filter(n => canAccessModule(n.module || n.curso || ''))
+    .filter(n => {
+      const aid = n.activityId || (n.id || '').replace(/^an_/, '');
+      if(aid && deleted && (deleted.has(aid) || deleted.has(n.id))) return false;
+      if(aid && valid && valid.size && !valid.has(aid)) return false;
+      return true;
+    })
     .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
 }
 function myUnreadActivityNotifs(){ return myActivityNotifs().filter(n => !n.read); }
@@ -549,6 +612,129 @@ function pruneOrphanActivityNotifs(validActivityIds, deletedIds){
     }
   } catch(e){ console.warn('pruneOrphanActivityNotifs:', e); }
   return 0;
+}
+/* IDs de actividades vigentes (toda relación —entregas, avisos, notas—
+   se valida contra este set por el ID único de la actividad). */
+function validActivityIdSet(){
+  try { return new Set(store().activities.map(a => a.id)); }
+  catch(e){ return new Set(); }
+}
+/* Poda entregas del caché cuya actividad fue borrada o ya no existe.
+   Por "ausencia" solo poda con set vigente no vacío (store sincronizado);
+   las lápidas podan siempre. Nunca toca entregas de otras actividades. */
+function pruneOrphanSubmissions(validIds, deletedIds){
+  try {
+    const d = store();
+    if(!d.submissions.length) return 0;
+    const valid = validIds instanceof Set ? validIds : validActivityIdSet();
+    const del = deletedIds instanceof Set ? deletedIds : getDeletedActivityIds();
+    const canPruneMissing = valid.size > 0;
+    const kept = d.submissions.filter(s => {
+      const aid = s.activityId || '';
+      if(aid && del.has(aid)) return false; // actividad borrada: fuera
+      if(aid && valid.has(aid)) return true; // vigente: se mantiene
+      if(!aid) return true; // legacy sin activityId: no tocar aquí
+      return canPruneMissing ? false : true; // huérfana: fuera (no revive)
+    });
+    if(kept.length !== d.submissions.length){
+      d.submissions = kept;
+      try { saveStore(d); } catch(e){}
+      return 1;
+    }
+  } catch(e){ console.warn('pruneOrphanSubmissions:', e); }
+  return 0;
+}
+/* Poda notificaciones de calificación huérfanas (localStorage). */
+function pruneOrphanGradeNotifs(validIds, deletedIds){
+  try {
+    const local = getGradeNotifs();
+    if(!local.length) return 0;
+    const valid = validIds instanceof Set ? validIds : validActivityIdSet();
+    const del = deletedIds instanceof Set ? deletedIds : getDeletedActivityIds();
+    const canPruneMissing = valid.size > 0;
+    let subIds = null;
+    try { subIds = new Set(store().submissions.map(s => s.id)); } catch(e){}
+    const kept = local.filter(n => {
+      const aid = n.activityId || '';
+      if(aid && del.has(aid)) return false;
+      if(aid && valid.has(aid)) return true;
+      if(aid && canPruneMissing) return false;
+      // Legacy sin activityId: fuera solo si su entrega ya no existe
+      if(!aid && n.submissionId && subIds && subIds.size && !subIds.has(n.submissionId)) return false;
+      return true;
+    });
+    if(kept.length !== local.length){ saveGradeNotifs(kept); return 1; }
+  } catch(e){ console.warn('pruneOrphanGradeNotifs:', e); }
+  return 0;
+}
+/* Limpieza en Firestore de datos obsoletos (solo docente, acotada por
+   sync). 1) Lápidas: aviso + entregas + notas de esas actividades. 2) Un
+   barrido legacy por sesión: docs cuya actividad ya no existe. Nunca borra
+   nada de actividades vigentes (todo filtrado por ID). */
+let _orphanScanDone = false;
+async function cleanupOrphanedCloudData(validIds, deletedIds){
+  if(!db || !session || session.rol !== 'docente') return 0;
+  const valid = validIds instanceof Set ? validIds : validActivityIdSet();
+  const del = deletedIds instanceof Set ? deletedIds : getDeletedActivityIds();
+  let cleaned = 0;
+  const delIds = [...del].slice(0, 10); // acota lecturas/escrituras por sync
+  async function deleteSubsByAid(aid){
+    try {
+      const snap = await db.collection('submissions').where('activityId', '==', aid).get();
+      if(snap.empty) return;
+      const paths = [];
+      snap.forEach(doc => { try { const dd = doc.data() || {}; if(dd.storagePath) paths.push(dd.storagePath); } catch(e){} });
+      await Promise.allSettled(snap.docs.map(x => cloudDelete('submissions', x.id)));
+      cleaned++;
+      if(paths.length) supaRemove(SUPA_BUCKET, paths);
+    } catch(e){ console.warn('cleanup subs:', aid, e); }
+  }
+  async function deleteGradesByAid(aid){
+    try {
+      const gsnap = await db.collection('grade_notifications').where('activityId', '==', aid).get();
+      if(gsnap.empty) return;
+      await Promise.allSettled(gsnap.docs.map(x => cloudDelete('grade_notifications', x.id)));
+      cleaned++;
+    } catch(e){ console.warn('cleanup grades:', aid, e); }
+  }
+  for(const aid of delIds){
+    try { await cloudDelete('activity_notifications', 'an_' + aid); } catch(e){}
+    await deleteSubsByAid(aid);
+    await deleteGradesByAid(aid);
+  }
+  if(cleaned) return cleaned;
+  // Barrido legacy una vez por sesión (actividades ya sincronizadas).
+  if(!_orphanScanDone && valid.size){
+    _orphanScanDone = true;
+    try {
+      const allS = await db.collection('submissions').get();
+      const dead = allS.docs.filter(x => { const a = (x.data() || {}).activityId || ''; return a && !valid.has(a) && !del.has(a); });
+      if(dead.length){
+        const paths = [];
+        dead.forEach(x => { try { const dd = x.data() || {}; if(dd.storagePath) paths.push(dd.storagePath); } catch(e){} });
+        await Promise.allSettled(dead.map(x => cloudDelete('submissions', x.id)));
+        cleaned++;
+        if(paths.length) supaRemove(SUPA_BUCKET, paths);
+      }
+    } catch(e){ console.warn('scan submissions:', e); }
+    try {
+      const allG = await db.collection('grade_notifications').get();
+      const deadG = allG.docs.filter(x => { const a = (x.data() || {}).activityId || ''; return a && !valid.has(a) && !del.has(a); });
+      if(deadG.length){
+        await Promise.allSettled(deadG.map(x => cloudDelete('grade_notifications', x.id)));
+        cleaned++;
+      }
+    } catch(e){ console.warn('scan grades:', e); }
+    try {
+      const allN = await db.collection('activity_notifications').get();
+      const deadN = allN.docs.filter(x => { const dd = x.data() || {}; const a = dd.activityId || (x.id || '').replace(/^an_/, ''); return a && !valid.has(a) && !del.has(a); });
+      if(deadN.length){
+        await Promise.allSettled(deadN.map(x => cloudDelete('activity_notifications', x.id)));
+        cleaned++;
+      }
+    } catch(e){ console.warn('scan notifs:', e); }
+  }
+  return cleaned;
 }
 async function pullActivityNotifsFromCloud(){
   if(!db) return 0;
@@ -1261,6 +1447,7 @@ function stripHeavy(o){
 /* Entregas: docente trae todo; estudiante solo las suyas (ahorra lecturas). */
 async function pullSubmissionsFromCloud(){
   if(!db || !session) return 0;
+  const deleted = await fetchDeletedActivityIds().catch(() => getDeletedActivityIds());
   let snap;
   if(session.rol === 'estudiante'){
     const mail = (session.email || '').toLowerCase();
@@ -1275,33 +1462,52 @@ async function pullSubmissionsFromCloud(){
     snap = await db.collection('submissions').get();
   }
   const d = store();
-  const byId = new Map(d.submissions.map(s => [s.id, s]));
+  const cloudIds = new Set(snap.docs.map(x => x.id));
+  const byId = new Map();
   let changed = 0;
+  // La nube manda: parte SOLO de los docs existentes (lo borrado sale).
   snap.forEach(doc => {
     const cloud = Object.assign({}, doc.data() || {}, { id: doc.id });
-    const local = byId.get(doc.id);
-    if(session.rol === 'estudiante'){
-      // No pisar una lectura local ya hecha sobre la nube vieja.
-      if(local && JSON.stringify(local) === JSON.stringify(cloud)) return;
-    }
-    if(!local || JSON.stringify(local) !== JSON.stringify(cloud)) changed++;
+    const aid = cloud.activityId || '';
+    if(aid && deleted.has(aid)) return; // actividad borrada: ignorar doc zombie
+    const local = d.submissions.find(s => s.id === doc.id);
+    if(local && JSON.stringify(local) !== JSON.stringify(cloud)) changed++;
+    else if(!local) changed++;
     byId.set(doc.id, cloud);
   });
-  // Limpieza estudiante: si la nube ya no trae un id propio que solo
-  // existía en caché vieja de otro dispositivo, se conserva (offline).
-  const merged = (session.rol === 'estudiante')
-    ? [...byId.values()].filter(s => {
-        // Conserva solo mis entregas (evita ver las de otros por caché vieja).
-        const mine = ((s.email || '').toLowerCase() === (session.email || '').toLowerCase());
-        if(!mine){
-          // Si el caché local trae entregas ajenas de sesiones anteriores, depúralas.
-          const stillInCloud = snap.docs.some(x => x.id === s.id);
-          return stillInCloud;
-        }
-        return true;
-      })
-    : [...byId.values()];
-  if(changed || merged.length !== d.submissions.length){
+  // Locales que la nube no trae: re-sube solo creaciones offline frescas;
+  // el resto estaba borrado en otro dispositivo → se poda (no revive).
+  const lastSync = _lastFullSyncAt || '';
+  d.submissions.forEach(s => {
+    if(byId.has(s.id)) return;
+    if((s.activityId && deleted.has(s.activityId))) { changed++; return; }
+    const created = s.fecha || s.actualizadoEn || '';
+    const isFresh = lastSync && created && created >= lastSync;
+    if(isFresh){
+      byId.set(s.id, s);
+      try { const lite = Object.assign({}, s); if(lite.dataUrl && lite.dataUrl.length > 900000) delete lite.dataUrl; cloudSave('submissions', s.id, lite); } catch(e){}
+    } else { changed++; }
+  });
+  let merged = [...byId.values()];
+  if(session.rol === 'estudiante'){
+    // Conserva solo mis entregas (evita ver las de otros por caché vieja).
+    merged = merged.filter(s => ((s.email || '').toLowerCase() === (session.email || '').toLowerCase()));
+  }
+  // Poda huérfanas por actividad (tombstones + actividades inexistentes).
+  try {
+    const valid = validActivityIdSet();
+    const before = merged.length;
+    merged = merged.filter(s => {
+      const aid = s.activityId || '';
+      if(aid && deleted.has(aid)) return false;
+      if(aid && valid.has(aid)) return true;
+      if(!aid) return true;
+      return valid.size ? false : true;
+    });
+    if(merged.length !== before) changed++;
+  } catch(e){}
+  const prevLen = d.submissions.length;
+  if(changed || merged.length !== prevLen){
     d.submissions = merged;
     try { saveStore(d); } catch(e){}
     return 1;
@@ -1325,12 +1531,24 @@ async function pullAllCloudData(manual){
     try { changed += await pullActivityNotifsFromCloud() ? 1 : 0; } catch(e){ console.warn('pull actNotifs:', e); }
     try { changed += await pullGradeNotifsFromCloud().catch(()=>0) ? 1 : 0; } catch(e){}
     try { changed += await pullPwdResetsFromCloud().catch(()=>0) ? 1 : 0; } catch(e){}
-    // Poda final de seguridad: avisos sin actividad vigente no reviven.
+    // Poda final de seguridad: nada borrado revive desde caché/localStorage.
+    // Solo se conservan datos de actividades vigentes (relación por ID).
     try {
       const deleted = getDeletedActivityIds();
       const valid = new Set(store().activities.map(a => a.id));
       if(pruneOrphanActivityNotifs(valid, deleted)) changed++;
+      if(pruneOrphanSubmissions(valid, deleted)) changed++;
+      if(pruneOrphanGradeNotifs(valid, deleted)) changed++;
     } catch(e){}
+    // Docente: elimina huérfanos legacy en Firestore (entregas, archivos,
+    // avisos y notas de actividades ya inexistentes). Acotado y por ID.
+    try {
+      if(session.rol === 'docente'){
+        const deleted = getDeletedActivityIds();
+        const valid = new Set(store().activities.map(a => a.id));
+        if(await cleanupOrphanedCloudData(valid, deleted)) changed++;
+      }
+    } catch(e){ console.warn('cleanup huérfanos:', e); }
     markFullSync();
     _cloudStatus = 'conectado';
     if(changed){ render(); if(manual) toast('✅ Sincronizado con la nube'); }
@@ -1380,8 +1598,21 @@ function subscribeRealtime(){
                 return !removedIds.includes(aid) && !removedIds.includes(n.id);
               });
               if(kept.length !== before.length) saveActivityNotifs(kept);
+              // Podar también entregas y notas de esas actividades (en vivo,
+              // en todos los dispositivos, sin esperar al próximo pull).
+              try {
+                const d2 = store();
+                const ks = d2.submissions.filter(s => !(s.activityId && removedIds.includes(s.activityId)));
+                if(ks.length !== d2.submissions.length){ d2.submissions = ks; try { saveStore(d2); } catch(e){} }
+              } catch(e){}
+              try {
+                const gk = getGradeNotifs().filter(n => !(n.activityId && removedIds.includes(n.activityId)));
+                if(gk.length !== getGradeNotifs().length) saveGradeNotifs(gk);
+              } catch(e){}
             }
             pruneOrphanActivityNotifs(new Set(d.activities.map(a => a.id)), getDeletedActivityIds());
+            try { pruneOrphanSubmissions(new Set(d.activities.map(a => a.id)), getDeletedActivityIds()); } catch(e){}
+            try { pruneOrphanGradeNotifs(new Set(d.activities.map(a => a.id)), getDeletedActivityIds()); } catch(e){}
           } catch(e){}
           // Si es estudiante y llegó una actividad nueva publicada, avisa.
           try { detectNewActivityAlert(snap); } catch(e){}
@@ -1398,12 +1629,25 @@ function subscribeRealtime(){
         const d = store();
         const byId = new Map(d.submissions.map(s => [s.id, s]));
         let changed = false;
+        let delRT = null;
+        try { delRT = getDeletedActivityIds(); } catch(e){}
         snap.docChanges().forEach(ch => {
           const data = Object.assign({}, ch.doc.data() || {}, { id: ch.doc.id });
+          const aid = data.activityId || '';
+          // Doc zombie de actividad borrada: no entra al caché (ni revive).
+          if(aid && delRT && delRT.has(aid)){
+            if(byId.delete(ch.doc.id)) changed = true;
+            return;
+          }
           if(ch.type === 'removed'){ if(byId.delete(ch.doc.id)) changed = true; }
           else { const cur = byId.get(ch.doc.id); if(!cur || JSON.stringify(cur) !== JSON.stringify(data)){ byId.set(ch.doc.id, data); changed = true; } }
         });
-        if(changed){ d.submissions = [...byId.values()]; try{ saveStore(d); }catch(e){} render(); }
+        if(changed){
+          d.submissions = [...byId.values()];
+          try{ saveStore(d); }catch(e){}
+          try { pruneOrphanSubmissions(validActivityIdSet(), getDeletedActivityIds()); } catch(e){}
+          render();
+        }
       } catch(e){ console.warn('RT submissions:', e); }
     }, err => console.warn('RT submissions error:', err)));
     // 3) Avisos de nuevas actividades en vivo
@@ -1430,7 +1674,13 @@ function subscribeRealtime(){
         }
       } catch(e){ console.warn('RT actNotifs:', e); }
     }, err => console.warn('RT actNotifs error:', err)));
-    // 4) Calificaciones y claves en vivo (solo estudiante)
+    // 4) Calificaciones y claves en vivo
+    // Docente: ve/borra notas igual en todo dispositivo (solo vigentes).
+    if(session.rol !== 'estudiante'){
+      _unsubs.push(db.collection('grade_notifications').onSnapshot(async () => {
+        try { const c = await pullGradeNotifsFromCloud().catch(()=>0); if(c) render(); else refreshNavBadge(); } catch(e){}
+      }, err => console.warn('RT grades error:', err)));
+    }
     if(session.rol === 'estudiante'){
       const mail = session.email;
       _unsubs.push(db.collection('grade_notifications').where('studentEmail', '==', (mail||'').toLowerCase()).onSnapshot(async () => {
@@ -1747,8 +1997,19 @@ function visibleActivities(){
 /* ---------- 4. Dashboard docente ---------- */
 function viewDashDocente(){
   const {activities,submissions}=store();
+  // Solo información vigente: excluye entregas de actividades borradas o
+  // inexistentes (relación por ID único) para que lo eliminado no reaparezca.
+  let deletedDash = null;
+  try { deletedDash = getDeletedActivityIds(); } catch(e){}
+  const validDash = new Set(activities.map(a=>a.id));
+  const liveSubs = submissions.filter(s => {
+    const aid = s.activityId || '';
+    if(aid && deletedDash && deletedDash.has(aid)) return false;
+    if(aid && !validDash.has(aid)) return false;
+    return true;
+  });
   const total=activities.length;
-  const recibidas=submissions.length;
+  const recibidas=liveSubs.length;
   const pendientes=new Set(activities.filter(a=>a.estado==='publicada').map(a=>a.id)).size*getAllStudents().length - recibidas;
   const publicadas=activities.filter(a=>a.estado==='publicada').length;
   const recientes=[...activities].slice(-4).reverse();
@@ -1782,7 +2043,7 @@ function viewDashDocente(){
   </div>
   <div class="grid2">
     <div class="card">
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><h3 style="flex:1">Actividades recientes</h3><button class="btn btn-primary btn-sm" onclick="navigate('crear')">+ Crear actividad</button></div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap"><h3 style="flex:1;min-width:0">Actividades recientes</h3><button class="btn btn-primary btn-sm" onclick="navigate('crear')">+ Crear actividad</button></div>
       ${recientes.map(a=>{
         const n=store().submissions.filter(s=>s.activityId===a.id).length;
         const st=a.estado==='borrador'?{key:'borrador',label:'Borrador'}:{key:'publicada',label:'Publicada'};
@@ -1794,7 +2055,7 @@ function viewDashDocente(){
     </div>
     <div class="card">
       <h3>📤 Últimos trabajos</h3><p class="desc">Trabajos recibidos recientemente.</p>
-      ${store().submissions.slice(-4).reverse().map(s=>`<div class="file-chip">📄 <b>${escHtml(s.estudiante)}</b> · ${escHtml(s.archivo)} ${gradeOf(s)!=null?`· ⭐ ${gradeOf(s)}/20`:''}<br><small style="color:#64748b">${fmtFechaHora(s.fecha)} ${s.late?'· ⚠️ tardía':''}</small><button class="btn btn-outline btn-sm" onclick="downloadSubmission('${s.id}')">Descargar</button></div>`).join('')||'<div class="empty">Sin trabajos todavía. Aparecerán aquí cuando los estudiantes presenten.</div>'}
+      ${liveSubs.slice(-4).reverse().map(s=>`<div class="file-chip">📄 <b>${escHtml(s.estudiante)}</b> · ${escHtml(s.archivo)} ${gradeOf(s)!=null?`· ⭐ ${gradeOf(s)}/20`:''}<br><small style="color:#64748b">${fmtFechaHora(s.fecha)} ${s.late?'· ⚠️ tardía':''}</small><button class="btn btn-outline btn-sm" onclick="downloadSubmission('${s.id}')">Descargar</button></div>`).join('')||'<div class="empty">Sin trabajos todavía. Aparecerán aquí cuando los estudiantes presenten.</div>'}
       <div style="margin-top:12px"><button class="btn btn-outline btn-sm" onclick="navigate('entregas')">Abrir trabajos de estudiantes →</button></div>
     </div>
   </div>`;
@@ -2439,10 +2700,24 @@ function viewNotificaciones(){
   if(session.rol === 'docente'){
     const all = getPwdResets().sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
     const pend = all.filter(r=>r.status==='pendiente').length;
-    const grades = getGradeNotifs().sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')).slice(0,30);
-    const broadcasts = getActivityNotifs().sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')).slice(0,20);
+    // Solo información vigente de Firestore: excluye avisos y notas de
+    // actividades borradas o inexistentes (no deben reaparecer).
+    let delN = null, validN = null;
+    try { delN = getDeletedActivityIds(); validN = validActivityIdSet(); } catch(e){}
+    const isLiveN = (aid, nid) => {
+      if(aid && delN && delN.has(aid)) return false;
+      if(nid && delN && delN.has(nid)) return false;
+      if(aid && validN && validN.size && !validN.has(aid)) return false;
+      return true;
+    };
+    const gradesLive = getGradeNotifs()
+      .filter(n => isLiveN(n.activityId, null));
+    const broadcastsLive = getActivityNotifs()
+      .filter(n => isLiveN(n.activityId || (n.id||'').replace(/^an_/,'') , n.id));
+    const grades = [...gradesLive].sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')).slice(0,30);
+    const broadcasts = [...broadcastsLive].sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')).slice(0,20);
     return `<h1 class="page-title">🔔 Notificaciones</h1>
-    <p class="page-sub">${all.length} restablecimientos (${pend} pendientes) · ${getGradeNotifs().length} calificaciones notificadas · ${getActivityNotifs().length} avisos de actividad.</p>
+    <p class="page-sub">${all.length} restablecimientos (${pend} pendientes) · ${gradesLive.length} calificaciones notificadas · ${broadcastsLive.length} avisos de actividad.</p>
     <div class="alert ${_cloudStatus==='conectado'?'alert-green':'alert-yellow'}" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="flex:1;min-width:200px">${_cloudStatus==='conectado'?'☁️ Nube conectada: tus publicaciones y calificaciones llegan a todos los dispositivos en tiempo real.':'⚠️ Estado nube: '+_cloudStatus+'. Pulsa Actualizar y revisa conexión / reglas.'}</span><button class="btn btn-outline btn-sm" onclick="pullAllCloudData(true)">🔄 Actualizar</button></div>
     <div class="card"><h3>📚 Avisos de actividad enviados</h3>
       <p class="desc">Cada actividad publicada genera un aviso automático a los estudiantes (llega a cualquier dispositivo).</p>
