@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EduAula — Plataforma Educativa Secundaria</title>
+<meta name="description" content="EduAula: aula virtual de secundaria para gestionar actividades, trabajos y calificaciones de los módulos de Móviles y Ensamblaje.">
+<meta name="theme-color" content="#4f46e5">
+<meta property="og:title" content="EduAula — Plataforma Educativa Secundaria">
+<meta property="og:description" content="Gestión de actividades, trabajos y calificaciones por módulos. Simple, moderna y responsive.">
+<meta property="og:type" content="website">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+<!-- Firebase SDK (compat para usar con app.js global) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+</head>
+<body>
+<a class="skip-link" href="#view">Saltar al contenido principal</a>
+
+<!-- Splash de arranque: cubre la pantalla mientras se restaura la sesión (evita el parpadeo del login) -->
+<div id="bootView">
+  <div class="boot-box"><div class="boot-logo">🎓</div><div class="boot-spin"></div><p>Abriendo EduAula…</p></div>
+</div>
+
+<!-- ============ LOGIN (Pantalla 1) ============ -->
+<div id="loginView" class="login-wrap" style="display:none">
+  <div class="login-hero">
+    <div style="font-size:15px;font-weight:800;letter-spacing:.06em;opacity:.9">🎓 EDUAULA · SECUNDARIA</div>
+    <h1>Tu aula virtual,<br>simple y moderna.</h1>
+    <p>Gestión de actividades y tareas de tus <b>2 módulos</b>.</p>
+    <div class="hero-badges">
+      <span class="hero-badge">📚 2 módulos activos</span>
+      <span class="hero-badge">⏰ Control de fechas y horas</span>
+      <span class="hero-badge">📱 Responsive total</span>
+    </div>
+    <div class="hero-cards">
+      <div class="hero-mini"><b>📱 Desarrollo de aplicaciones móviles y videojuegos</b><br><span>Crea apps móviles y tus primeros videojuegos.</span></div>
+      <div class="hero-mini"><b>🛠️ Ensamblaje y reparación de computadoras, redes y seguridad informática</b><br><span>Hardware, redes y seguridad informática.</span></div>
+    </div>
+  </div>
+  <div class="login-panel">
+    <div class="login-card">
+      <h2 id="authTitle">Iniciar sesión</h2>
+      <p class="sub" id="authSub">Accede según tu rol: docente o estudiante.</p>
+      <div class="role-switch" role="group" aria-label="Seleccionar rol de acceso">
+        <button id="roleDocente" class="active" onclick="switchRole('docente')" aria-pressed="true">👩‍🏫 Docente</button>
+        <button id="roleEstudiante" onclick="switchRole('estudiante')" aria-pressed="false">🧑‍🎓 Estudiante</button>
+      </div>
+      <div class="field" id="regNameField" style="display:none"><label for="regName">Nombre completo</label><input id="regName" placeholder="Ej. Ana Quispe" autocomplete="name"></div>
+      <div class="form-grid" id="regGradeRow" style="display:none">
+        <div class="field"><label for="regGrado">Grado</label><select id="regGrado"><option value="">Selecciona…</option><option>1.°</option><option>2.°</option><option>3.°</option><option selected>4.°</option><option>5.°</option></select></div>
+        <div class="field"><label for="regSeccion">Sección</label><select id="regSeccion"><option value="">Selecciona…</option><option>A</option><option selected>B</option><option>C</option><option>D</option><option>E</option></select></div>
+      </div>
+      <div class="field"><label for="loginEmail">Correo institucional</label><input id="loginEmail" type="email" value="" placeholder="usuario@colegio.edu" autocomplete="email"></div>
+      <div class="field"><label for="loginPass">Contraseña</label><div class="pass-wrap"><input id="loginPass" type="password" value="" placeholder="Mínimo 6 caracteres" autocomplete="current-password"><button type="button" class="pass-toggle" onclick="togglePassword()" title="Mostrar / ocultar contraseña" aria-label="Mostrar u ocultar contraseña">👁️</button></div><small id="passHint">Firebase: usa tu contraseña real registrada.</small></div>
+      <div id="authError" class="alert alert-red" style="display:none"></div>
+      <button class="btn btn-primary" id="btnLogin" style="width:100%" onclick="doLogin()">Ingresar →</button>
+      <button class="btn btn-success" id="btnRegister" style="width:100%;display:none" onclick="doRegister()">Crear cuenta ✨</button>
+      <p style="text-align:center;font-size:13.5px;margin:12px 0 0">
+        <span id="toRegister">¿No tienes cuenta? <a href="#" onclick="toggleAuthMode('register');return false" style="color:var(--primary);font-weight:700">Regístrate aquí</a></span>
+        <span id="toLogin" style="display:none">¿Ya tienes cuenta? <a href="#" onclick="toggleAuthMode('login');return false" style="color:var(--primary);font-weight:700">Inicia sesión</a></span>
+      </p>
+    </div>
+  </div>
+</div>
+
+<!-- ============ APP SHELL ============ -->
+<div id="app" class="app">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <div class="brand-logo">🎓</div>
+      <div><b>EduAula</b><span id="brandRole">Panel docente</span></div>
+    </div>
+    <nav class="nav" id="sideNav" aria-label="Navegación principal"></nav>
+    <div class="user-mini">
+      <div class="avatar" id="miniAvatar" aria-hidden="true">C</div>
+      <div style="flex:1;min-width:0"><b id="miniName" style="font-size:13.5px">—</b><br><span id="miniMail" style="font-size:12px;opacity:.7">—</span></div>
+      <button class="btn btn-sm" style="background:rgba(255,255,255,.12);color:#fff" onclick="logout()" title="Cerrar sesión" aria-label="Cerrar sesión">⏻</button>
+    </div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <button class="hamburger" onclick="document.getElementById('sidebar').classList.toggle('open')" aria-label="Abrir o cerrar menú" aria-controls="sidebar">☰</button>
+      <div class="search" role="search">🔍 <input id="globalSearch" placeholder="Buscar actividades…" oninput="onGlobalSearch(this.value)" aria-label="Buscar actividades"></div>
+      <div class="top-actions">
+        <span class="pill-role" id="rolePill">DOCENTE</span>
+        <button class="btn btn-outline btn-sm" id="topCreateBtn" onclick="navigate('crear')">+ Crear actividad</button>
+      </div>
+    </div>
+    <main class="content" id="view" tabindex="-1"></main>
+  </div>
+</div>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+// Respaldo: si app.js no carga o Firebase se cuelga, no dejar al usuario en el splash eternamente
+setTimeout(function(){
+  if(!window.__eduaula_booted){
+    var b=document.getElementById('bootView'); if(b) b.style.display='none';
+    var l=document.getElementById('loginView'); if(l && !document.getElementById('app').classList.contains('visible')) l.style.display='';
+    window.__eduaula_booted=true;
+  }
+},8000);
+</script>
+<script src="app.js"></script>
+</body>
+</html>
