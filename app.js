@@ -154,6 +154,8 @@ function resetAllData(){
     localStorage.removeItem('eduaula_users_extra');
     localStorage.removeItem('eduaula_pwd_resets');
     localStorage.removeItem('eduaula_grade_notifs');
+    localStorage.removeItem('eduaula_activity_notifs');
+    localStorage.removeItem('eduaula_last_sync');
   } catch(e){}
   _memStore = null;
   initStore();
@@ -285,8 +287,8 @@ function myUnreadGradeNotifs(){
 }
 function studentNotifCount(){
   if(!session || session.rol !== 'estudiante') return 0;
-  try { return myPendingResets().length + myUnreadGradeNotifs().length; }
-  catch(e){ return 0; }
+  try { return myPendingResets().length + myUnreadGradeNotifs().length + myUnreadActivityNotifs().length; }
+  catch(e){ try { return myPendingResets().length; } catch(_){ return 0; } }
 }
 /* Crea/actualiza la notificación de un trabajo recién calificado.
    Al recalificar se reemplaza la anterior (local + nube) para que el
@@ -451,17 +453,130 @@ async function pullPwdResetsFromCloud(){
    manual=true ignora el intervalo mínimo (botón 🔄 Actualizar). */
 async function pullStudentNotifs(manual){
   if(!session || session.rol !== 'estudiante') return;
-  if(!db){ if(manual) toast('⚠️ Sin conexión a la nube. Revisa tu internet.'); return; }
-  const now = Date.now();
-  if(!manual && now - _lastNotifPull < 20000) return;
-  _lastNotifPull = now;
-  if(manual) toast('🔄 Buscando notificaciones…');
+  // Unifica: el botón 🔄 Actualizar ahora sincroniza TODO (actividades +
+  // avisos + notas + claves), no solo notificaciones.
+  return pullAllCloudData(manual);
+}
+/* ============================================================
+   NOTIFICACIONES DE NUEVA ACTIVIDAD — avisan al estudiante en
+   cualquier dispositivo cuando el docente publica (broadcast en
+   colección `activity_notifications`: 1 doc por actividad).
+   ============================================================ */
+const ACTIVITY_NOTIF_KEY = 'eduaula_activity_notifs';
+function getActivityNotifs(){
   try {
-    const g = await pullGradeNotifsFromCloud().catch(() => 0);
-    const p = await pullPwdResetsFromCloud().catch(() => 0);
-    if(g || p){ render(); toast('🔔 Notificaciones actualizadas'); }
-    else { refreshNavBadge(); if(manual) toast('✅ Ya estás al día'); }
-  } catch(e){ console.warn('Pull notifs falló:', e); if(manual) toast('⚠️ No se pudo sincronizar'); }
+    const arr = JSON.parse(localStorage.getItem(ACTIVITY_NOTIF_KEY) || '[]');
+    return Array.isArray(arr) ? arr : [];
+  } catch(e){ return []; }
+}
+function saveActivityNotifs(arr){
+  try { localStorage.setItem(ACTIVITY_NOTIF_KEY, JSON.stringify(arr)); } catch(e){}
+}
+function myActivityNotifs(){
+  if(!session || session.rol !== 'estudiante') return [];
+  return getActivityNotifs()
+    .filter(n => canAccessModule(n.module || n.curso || ''))
+    .sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
+}
+function myUnreadActivityNotifs(){ return myActivityNotifs().filter(n => !n.read); }
+function markActivityNotifRead(notifId){
+  const arr = getActivityNotifs();
+  const n = arr.find(x => x.id === notifId);
+  if(!n) return;
+  n.read = true; n.readAt = new Date().toISOString();
+  saveActivityNotifs(arr);
+  cloudSave('activity_notifications', n.id, n);
+  toast('✅ Aviso marcado como leído');
+  render();
+}
+function markAllActivitiesRead(){
+  if(!session || session.rol !== 'estudiante') return;
+  const arr = getActivityNotifs();
+  let c = 0;
+  arr.forEach(n => { if(!n.read && canAccessModule(n.module || '')){ n.read = true; n.readAt = new Date().toISOString(); c++; cloudSave('activity_notifications', n.id, n); } });
+  saveActivityNotifs(arr);
+  toast(c ? `✅ ${c} avisos marcados como leídos` : 'ℹ️ No tienes avisos pendientes');
+  render();
+}
+async function pullActivityNotifsFromCloud(){
+  if(!db) return 0;
+  const snap = await db.collection('activity_notifications').get();
+  if(snap.empty) return 0;
+  const local = getActivityNotifs();
+  const byId = new Map(local.map(n => [n.id, n]));
+  snap.forEach(doc => {
+    const d = Object.assign({}, doc.data() || {}, { id: doc.id });
+    const cur = byId.get(doc.id);
+    if(!cur){ byId.set(doc.id, d); }
+    else {
+      if(cur.read){ d.read = true; d.readAt = d.readAt || cur.readAt; }
+      byId.set(doc.id, Object.assign({}, cur, d));
+    }
+  });
+  const merged = [...byId.values()];
+  if(JSON.stringify(merged) === JSON.stringify(local)) return 0;
+  saveActivityNotifs(merged);
+  return 1;
+}
+/* Docente: crea/actualiza el aviso broadcast al publicar. Se llama
+   DESPUÉS de guardar la actividad en Firestore. */
+async function pushActivityBroadcast(activity){
+  if(!activity || activity.estado !== 'publicada') return;
+  const notif = {
+    id: 'an_' + activity.id,
+    activityId: activity.id,
+    activityTitle: activity.titulo || 'Nueva actividad',
+    module: activity.curso || '',
+    descripcion: (activity.descripcion || '').slice(0, 200),
+    limite: activity.limite || '',
+    hora: activity.hora || '',
+    createdBy: (session && session.email) || activity.creadoPor || '',
+    createdAt: new Date().toISOString(),
+    read: false, readAt: null
+  };
+  // Caché local inmediata (el docente también la ve en Notificaciones).
+  const local = getActivityNotifs();
+  const i = local.findIndex(n => n.id === notif.id);
+  // Si ya existía y ya fue leída por este dispositivo, conserva lectura.
+  if(i >= 0 && local[i].read){ notif.read = local[i].read; notif.readAt = local[i].readAt; }
+  if(i >= 0) local[i] = Object.assign({}, local[i], notif, { read: local[i].read || false });
+  else local.push(notif);
+  saveActivityNotifs(local);
+  await cloudSave('activity_notifications', notif.id, sanitizeForFirestore(notif));
+}
+/* Detecta actividad publicada nueva que aún no tiene aviso (respaldo por
+   si el broadcast falló) y genera el aviso local + nube. */
+async function detectNewActivityAlert(){
+  if(!session || session.rol !== 'estudiante' || !db) return;
+  try {
+    const known = new Set(getActivityNotifs().map(n => n.activityId));
+    const fresh = store().activities.filter(a =>
+      a.estado === 'publicada' && !known.has(a.id) && canAccessModule(a.curso));
+    for(const a of fresh.slice(0, 5)){
+      await pushActivityBroadcastStudentSide(a);
+    }
+  } catch(e){}
+}
+async function pushActivityBroadcastStudentSide(a){
+  const notif = {
+    id: 'an_' + a.id, activityId: a.id, activityTitle: a.titulo || 'Nueva actividad',
+    module: a.curso || '', descripcion: (a.descripcion || '').slice(0, 200),
+    limite: a.limite || '', hora: a.hora || '',
+    createdBy: a.creadoPor || '', createdAt: a.creadoEn || new Date().toISOString(),
+    read: false, readAt: null
+  };
+  const local = getActivityNotifs();
+  if(local.some(n => n.id === notif.id)) return;
+  local.push(notif);
+  saveActivityNotifs(local);
+  try { await cloudSave('activity_notifications', notif.id, sanitizeForFirestore(notif)); } catch(e){}
+}
+function pendingActivityBanner(){
+  let unread = [];
+  try { unread = myUnreadActivityNotifs(); } catch(e){ unread = []; }
+  if(!unread.length) return '';
+  const n = unread[0];
+  return `<div class="alert alert-blue">📚 <b>Nueva actividad publicada:</b> ${escHtml(n.activityTitle)} · ${escHtml(courseOf(n.module).corto || '')}${n.limite?` · ⏰ ${fmtFecha(n.limite)}`:''} <button class="btn btn-primary btn-sm" onclick="navigate('actividad','${n.activityId}')">Ver ahora →</button>${unread.length>1?` <small>(+${unread.length-1} más)</small>`:''}</div>`;
 }
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2600); }
 /* ============================================================
@@ -946,12 +1061,255 @@ function resendReset(resetId){
   render();
 }
 
-/* ---------- Espejo Firestore (no bloquea la UI; local es la fuente inmediata) ---------- */
+/* ---------- Nube Firestore como FUENTE DE VERDAD (multi-dispositivo) ----------
+   Antes: localStorage era la única fuente para activities/submissions y
+   Firestore solo un espejo de escritura. El estudiante en otro dispositivo
+   nunca veía lo creado por el docente. Ahora:
+   - Toda escritura va a Firestore (await, con error visible).
+   - Al iniciar sesión se hace PULL completo y se suscribe onSnapshot
+     (tiempo real): cualquier actividad publicada aparece sola, sin recargar.
+   - localStorage queda SOLO como caché offline, nunca como verdad. */
+function sanitizeForFirestore(obj){
+  // Firestore rechaza `undefined` y valores enormes (dataUrl). Limpia.
+  try {
+    const clean = JSON.parse(JSON.stringify(obj, (k, v) => (v === undefined ? null : v)));
+    return clean;
+  } catch(e){ return obj; }
+}
 function cloudSave(collection, id, data){
-  try { if(db) db.collection(collection).doc(id).set(data, { merge:true }).catch(e=>console.warn('Cloud save '+collection+' falló:', e)); } catch(e){}
+  try {
+    if(!db) return Promise.resolve(false);
+    const clean = sanitizeForFirestore(data);
+    return db.collection(collection).doc(id).set(clean, { merge:true })
+      .then(()=>true)
+      .catch(e=>{ console.warn('Cloud save '+collection+' falló:', e); return false; });
+  } catch(e){ return Promise.resolve(false); }
 }
 function cloudDelete(collection, id){
-  try { if(db) db.collection(collection).doc(id).delete().catch(()=>{}); } catch(e){}
+  try {
+    if(!db) return Promise.resolve(false);
+    return db.collection(collection).doc(id).delete().catch(()=>false).then(()=>true);
+  } catch(e){ return Promise.resolve(false); }
+}
+/* Estado de conexión con Firebase (para UI y diagnóstico). */
+let _cloudStatus = 'desconocido'; // 'conectado' | 'sin-conexion' | 'error-permisos'
+async function checkFirebaseConnection(){
+  if(!db){
+    _cloudStatus = 'sin-conexion';
+    return { ok:false, reason:'sdk-no-cargado' };
+  }
+  try {
+    // Lectura barata para verificar reglas/conectividad.
+    await db.collection('activities').limit(1).get();
+    _cloudStatus = 'conectado';
+    return { ok:true };
+  } catch(e){
+    console.warn('checkFirebaseConnection:', e);
+    _cloudStatus = (e && e.code === 'permission-denied') ? 'error-permisos' : 'sin-conexion';
+    return { ok:false, reason: e && e.code ? e.code : (e && e.message) || 'desconocido', error: e };
+  }
+}
+/* --- PULL: trae todo lo compartido y lo fusiona al caché local --- */
+let _lastCloudPull = 0;
+let _lastFullSyncAt = '';
+try { _lastFullSyncAt = localStorage.getItem('eduaula_last_sync') || ''; } catch(e){}
+function markFullSync(){
+  _lastCloudPull = Date.now();
+  _lastFullSyncAt = new Date().toISOString();
+  try { localStorage.setItem('eduaula_last_sync', _lastFullSyncAt); } catch(e){}
+}
+/* Actividades: la nube manda. Fusiona por id (nube gana) y conserva
+   creaciones locales offline para re-subirlas. */
+async function pullActivitiesFromCloud(){
+  if(!db) return 0;
+  const snap = await db.collection('activities').get();
+  const d = store();
+  const byId = new Map(d.activities.map(a => [a.id, a]));
+  let changed = 0;
+  snap.forEach(doc => {
+    const cloud = Object.assign({}, doc.data() || {}, { id: doc.id });
+    const local = byId.get(doc.id);
+    if(!local || JSON.stringify(local) !== JSON.stringify(cloud)){ changed++; }
+    byId.set(doc.id, cloud);
+  });
+  const cloudIds = new Set(snap.docs.map(x => x.id));
+  // Re-sube creaciones locales offline que la nube aún no tiene.
+  const onlyLocal = [...byId.values()].filter(a => !cloudIds.has(a.id));
+  onlyLocal.forEach(a => { try { cloudSave('activities', a.id, stripHeavy(a)); } catch(e){} });
+  const merged = [...byId.values()];
+  if(changed || merged.length !== d.activities.length){
+    d.activities = merged;
+    try { saveStore(d); } catch(e){}
+    return 1;
+  }
+  return 0;
+}
+function stripHeavy(o){
+  const lite = Object.assign({}, o);
+  // No subir dataUrls gigantes a Firestore (límite 1MB por doc).
+  if(lite.materialData && lite.materialData.length > 900000) delete lite.materialData;
+  if(lite.dataUrl && lite.dataUrl.length > 900000) delete lite.dataUrl;
+  return sanitizeForFirestore(lite);
+}
+/* Entregas: docente trae todo; estudiante solo las suyas (ahorra lecturas). */
+async function pullSubmissionsFromCloud(){
+  if(!db || !session) return 0;
+  let snap;
+  if(session.rol === 'estudiante'){
+    const mail = (session.email || '').toLowerCase();
+    if(!mail) return 0;
+    // Algunas entregas viejas guardaron email con mayúsculas: trae por
+    // el correo exacto y filtra insensible a mayúsculas en memoria.
+    snap = await db.collection('submissions').where('email', '==', session.email).get();
+    if(snap.empty && session.email !== mail){
+      snap = await db.collection('submissions').where('email', '==', mail).get();
+    }
+  } else {
+    snap = await db.collection('submissions').get();
+  }
+  const d = store();
+  const byId = new Map(d.submissions.map(s => [s.id, s]));
+  let changed = 0;
+  snap.forEach(doc => {
+    const cloud = Object.assign({}, doc.data() || {}, { id: doc.id });
+    const local = byId.get(doc.id);
+    if(session.rol === 'estudiante'){
+      // No pisar una lectura local ya hecha sobre la nube vieja.
+      if(local && JSON.stringify(local) === JSON.stringify(cloud)) return;
+    }
+    if(!local || JSON.stringify(local) !== JSON.stringify(cloud)) changed++;
+    byId.set(doc.id, cloud);
+  });
+  // Limpieza estudiante: si la nube ya no trae un id propio que solo
+  // existía en caché vieja de otro dispositivo, se conserva (offline).
+  const merged = (session.rol === 'estudiante')
+    ? [...byId.values()].filter(s => {
+        // Conserva solo mis entregas (evita ver las de otros por caché vieja).
+        const mine = ((s.email || '').toLowerCase() === (session.email || '').toLowerCase());
+        if(!mine){
+          // Si el caché local trae entregas ajenas de sesiones anteriores, depúralas.
+          const stillInCloud = snap.docs.some(x => x.id === s.id);
+          return stillInCloud;
+        }
+        return true;
+      })
+    : [...byId.values()];
+  if(changed || merged.length !== d.submissions.length){
+    d.submissions = merged;
+    try { saveStore(d); } catch(e){}
+    return 1;
+  }
+  return 0;
+}
+/* Sincronización total post-login + botón Actualizar. */
+async function pullAllCloudData(manual){
+  if(!session) return;
+  if(!db){ if(manual) toast('⚠️ Sin conexión a la nube. Revisa tu internet.'); return; }
+  const now = Date.now();
+  if(!manual && now - _lastCloudPull < 15000) return;
+  _lastCloudPull = now;
+  if(manual) toast('🔄 Sincronizando con la nube…');
+  try {
+    const parts = await Promise.allSettled([
+      pullActivitiesFromCloud(),
+      pullSubmissionsFromCloud(),
+      pullActivityNotifsFromCloud(),
+      pullGradeNotifsFromCloud().catch(()=>0),
+      pullPwdResetsFromCloud().catch(()=>0)
+    ]);
+    const changed = parts.some(p => p.status === 'fulfilled' && p.value);
+    markFullSync();
+    _cloudStatus = 'conectado';
+    if(changed){ render(); if(manual) toast('✅ Sincronizado con la nube'); }
+    else { refreshNavBadge(); if(manual) toast('✅ Ya estás al día'); }
+  } catch(e){
+    console.warn('pullAllCloudData falló:', e);
+    _cloudStatus = 'sin-conexion';
+    if(manual) toast('⚠️ No se pudo sincronizar. Revisa tu conexión y reglas de Firestore.');
+  }
+}
+/* --- TIEMPO REAL: onSnapshot; lo que el docente publique aparece solo --- */
+let _unsubs = [];
+function stopRealtime(){ try { _unsubs.forEach(u => { try{u();}catch(e){} }); } catch(e){} _unsubs = []; }
+function subscribeRealtime(){
+  stopRealtime();
+  if(!db || !session) return;
+  try {
+    // 1) Actividades en vivo
+    _unsubs.push(db.collection('activities').onSnapshot(snap => {
+      try {
+        const d = store();
+        const byId = new Map(d.activities.map(a => [a.id, a]));
+        let changed = false;
+        snap.docChanges().forEach(ch => {
+          const data = Object.assign({}, ch.doc.data() || {}, { id: ch.doc.id });
+          if(ch.type === 'removed'){ if(byId.delete(ch.doc.id)) changed = true; }
+          else {
+            const cur = byId.get(ch.doc.id);
+            if(!cur || JSON.stringify(cur) !== JSON.stringify(data)){ byId.set(ch.doc.id, data); changed = true; }
+          }
+        });
+        if(changed){
+          d.activities = [...byId.values()];
+          try { saveStore(d); } catch(e){}
+          // Si es estudiante y llegó una actividad nueva publicada, avisa.
+          try { detectNewActivityAlert(snap); } catch(e){}
+          render();
+        }
+      } catch(e){ console.warn('RT activities:', e); }
+    }, err => console.warn('RT activities error:', err)));
+    // 2) Entregas en vivo (docente: todas; estudiante: suyas)
+    const subQuery = (session.rol === 'estudiante')
+      ? db.collection('submissions').where('email', '==', session.email)
+      : db.collection('submissions');
+    _unsubs.push(subQuery.onSnapshot(snap => {
+      try {
+        const d = store();
+        const byId = new Map(d.submissions.map(s => [s.id, s]));
+        let changed = false;
+        snap.docChanges().forEach(ch => {
+          const data = Object.assign({}, ch.doc.data() || {}, { id: ch.doc.id });
+          if(ch.type === 'removed'){ if(byId.delete(ch.doc.id)) changed = true; }
+          else { const cur = byId.get(ch.doc.id); if(!cur || JSON.stringify(cur) !== JSON.stringify(data)){ byId.set(ch.doc.id, data); changed = true; } }
+        });
+        if(changed){ d.submissions = [...byId.values()]; try{ saveStore(d); }catch(e){} render(); }
+      } catch(e){ console.warn('RT submissions:', e); }
+    }, err => console.warn('RT submissions error:', err)));
+    // 3) Avisos de nuevas actividades en vivo
+    _unsubs.push(db.collection('activity_notifications').onSnapshot(snap => {
+      try {
+        const local = getActivityNotifs();
+        const byIdN = new Map(local.map(n => [n.id, n]));
+        let changed = false;
+        snap.docChanges().forEach(ch => {
+          const data = Object.assign({}, ch.doc.data() || {}, { id: ch.doc.id });
+          if(ch.type === 'removed'){ if(byIdN.delete(ch.doc.id)) changed = true; }
+          else {
+            const cur = byIdN.get(ch.doc.id);
+            // La lectura local manda: no revivir como sin leer lo ya leído.
+            if(cur && cur.read){ data.read = true; data.readAt = data.readAt || cur.readAt; }
+            if(!cur || JSON.stringify(cur) !== JSON.stringify(data)){ byIdN.set(ch.doc.id, data); changed = true; }
+          }
+        });
+        if(changed){
+          saveActivityNotifs([...byIdN.values()]);
+          render();
+          const unread = myUnreadActivityNotifs();
+          if(session.rol === 'estudiante' && unread.length) toast('📚 Nueva actividad: ' + (unread[0].activityTitle || 'revisa tus módulos'));
+        }
+      } catch(e){ console.warn('RT actNotifs:', e); }
+    }, err => console.warn('RT actNotifs error:', err)));
+    // 4) Calificaciones y claves en vivo (solo estudiante)
+    if(session.rol === 'estudiante'){
+      const mail = session.email;
+      _unsubs.push(db.collection('grade_notifications').where('studentEmail', '==', (mail||'').toLowerCase()).onSnapshot(async () => {
+        try { const c = await pullGradeNotifsFromCloud().catch(()=>0); if(c) render(); else refreshNavBadge(); } catch(e){}
+      }, ()=>{}));
+      _unsubs.push(db.collection('password_resets').where('studentEmail', '==', (mail||'').toLowerCase()).onSnapshot(async () => {
+        try { const c = await pullPwdResetsFromCloud().catch(()=>0); if(c) render(); else refreshNavBadge(); } catch(e){}
+      }, ()=>{}));
+    }
+  } catch(e){ console.warn('subscribeRealtime falló:', e); }
 }
 
 function getCachedUserByEmail(email){
@@ -1003,10 +1361,20 @@ function enterApp(user){
   document.getElementById('miniAvatar').style.background = session.rol==='docente'?'#7c3aed':'#0891b2';
   document.getElementById('topCreateBtn').style.display = session.rol==='docente'?'':'none';
   buildNav(); navigate('inicio');
-  if(session.rol === 'estudiante') pullStudentNotifs(false);
+  // Sincronización multi-dispositivo: PULL inicial + tiempo real.
+  // localStorage es solo caché; Firestore es la verdad compartida.
+  try {
+    pullAllCloudData(false);
+    subscribeRealtime();
+    checkFirebaseConnection().then(r => {
+      if(!r.ok && r.reason === 'error-permisos')
+        console.warn('Revisa Firestore Rules: permite read/write en activities, submissions, activity_notifications, grade_notifications, password_resets, users.');
+    });
+  } catch(e){ console.warn('Sync inicial falló:', e); }
 }
 function logout(){
   stopIdleWatch();
+  try { stopRealtime(); } catch(e){}
   clearPersistedSession();
   if(auth){ auth.signOut().finally(()=>location.reload()); }
   else location.reload();
@@ -1100,6 +1468,7 @@ function stopIdleWatch(){
 }
 function idleLogout(){
   stopIdleWatch();
+  try { stopRealtime(); } catch(e){}
   clearPersistedSession();
   try { localStorage.setItem('eduaula_idle_logout', '1'); } catch(e){}
   if(auth){ try { auth.signOut().finally(() => location.reload()); } catch(e){ location.reload(); } }
@@ -1173,12 +1542,12 @@ function onGlobalSearch(v){
 function render(){
   const v=document.getElementById('view');
   try { refreshNavBadge(); } catch(e){}
-  // El estudiante trae sus notificaciones de la nube (el docente las
-  // genera en otro dispositivo). Con intervalo mínimo para no saturar.
+  // Sincronización continua: tanto docente (ver entregas de otros
+  // dispositivos) como estudiante (ver actividades nuevas) traen la nube.
+  // El tiempo real (onSnapshot) ya empuja cambios; esto es respaldo por ruta.
   try {
-    if(session && session.rol==='estudiante' &&
-       (route==='inicio'||route==='notificaciones'||route==='misentregas'))
-      pullStudentNotifs(false);
+    if(session && (route==='inicio'||route==='notificaciones'||route==='misentregas'||route==='entregas'||route==='actividades'||route==='cursos'))
+      pullAllCloudData(false);
   } catch(e){}
   if(session.rol==='docente'){
     if(route==='inicio') return v.innerHTML=viewDashDocente();
@@ -1281,7 +1650,8 @@ function viewDashEst(){
     <div class="card" style="text-align:center;padding:36px">
       <div style="font-size:52px">📚</div>
       <h3>Sin actividades por ahora</h3>
-      <p class="desc">Tu docente aún no publica actividades. Vuelve pronto.</p>
+      <p class="desc">Tu docente aún no publica actividades — o aún no se sincronizan en este dispositivo. Pulsa Actualizar para traerlas de la nube.</p>
+      <button class="btn btn-primary btn-sm" onclick="pullAllCloudData(true)">🔄 Buscar actividades en la nube</button>
     </div>`;
   }
   let pend=0,pres=0,venc=0;
@@ -1379,7 +1749,8 @@ function viewCursoDetalle(cid){
 /* ---------- 7. Lista actividades ---------- */
 function viewActividades(q){
   return `<h1 class="page-title">📝 Actividades</h1>
-  <p class="page-sub">${session.rol==='docente'?'Crea, edita y elimina actividades.':'Consulta y entrega tus trabajos.'}</p>
+  <p class="page-sub">${session.rol==='docente'?'Crea, edita y elimina actividades. Se guardan en la nube y llegan solas a todos los dispositivos.':'Consulta y entrega tus trabajos. Se sincronizan en tiempo real desde la nube.'}</p>
+  <div class="alert ${_cloudStatus==='conectado'?'alert-green':'alert-yellow'}" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="flex:1;min-width:200px">${_cloudStatus==='conectado'?'☁️ Sincronizado con Firestore: lo que ves aquí es lo compartido.':'⚠️ Estado nube: '+_cloudStatus+'. Pulsa Actualizar.'}</span><button class="btn btn-outline btn-sm" onclick="pullAllCloudData(true)">🔄 Actualizar</button></div>
   ${session.rol==='estudiante' && Object.keys(COURSES).some(cid=>!canAccessModule(cid))?`<div class="alert alert-red">🔒 Bloqueado para ${formatGradoSeccion(session)}: ${Object.keys(COURSES).filter(cid=>!canAccessModule(cid)).map(id=>courseOf(id).nombre).join(' · ')}</div>`:''}
   <div class="card">
     <div style="display:flex;gap:10px;flex-wrap:wrap">
@@ -1498,9 +1869,32 @@ async function saveActivity(editId,estado){
     obj.creadoPor=d.activities[i].creadoPor||obj.creadoPor; d.activities[i]={...d.activities[i],...obj};
   }
   else { obj.material=obj.material||''; obj.materialData=obj.materialData||''; obj.materialMime=obj.materialMime||''; obj.materialUrl=obj.materialUrl||''; obj.materialPath=obj.materialPath||''; d.activities.push(obj); }
+  // 1) NUBE PRIMERO (fuente compartida): sin esto el estudiante en otro
+  // dispositivo jamás ve la actividad. Se espera la escritura y se avisa si falla.
+  obj.actualizadoEn = new Date().toISOString();
+  let cloudOk = false;
+  if(db){
+    try {
+      toast('☁️ Guardando en la nube…');
+      cloudOk = await cloudSave('activities', obj.id, stripHeavy(obj));
+      if(!cloudOk) toast('⚠️ Se guardó local pero la nube falló. Revisa tu conexión y reglas de Firestore.');
+    } catch(e){ console.warn('Guardado nube falló:', e); toast('⚠️ No se pudo guardar en la nube.'); }
+  } else {
+    toast('⚠️ Sin conexión a Firebase: solo se guardó en este dispositivo.');
+  }
   try{ saveStore(d); }catch(e){ try{ const lite={...obj,materialData:''}; const d2=store(); const ix=d2.activities.findIndex(a=>a.id===obj.id); if(ix>=0) d2.activities[ix]={...d2.activities[ix],...lite}; else d2.activities.push(lite); saveStore(d2); }catch(_){ toast('⚠️ No se pudo guardar (almacenamiento lleno)'); return; } }
-  try{ const lite={...obj}; if(lite.materialData && lite.materialData.length>900000) delete lite.materialData; cloudSave('activities', obj.id, lite); }catch(e){}
-  toast(estado==='borrador'?'💾 Borrador guardado en '+courseOf(obj.curso).corto:'🚀 Actividad publicada en '+courseOf(obj.curso).corto); navigate('curso', obj.curso);
+  // 2) NOTIFICACIÓN a estudiantes al publicar (broadcast, llega a todo dispositivo).
+  if(estado === 'publicada'){
+    try { await pushActivityBroadcast(obj); } catch(e){ console.warn('Broadcast actividad falló:', e); }
+  } else {
+    // Si vuelve a borrador, retira el aviso para no notificar algo no visible.
+    try { await cloudDelete('activity_notifications', 'an_' + obj.id); } catch(e){}
+    try {
+      const arr = getActivityNotifs().filter(n => n.id !== 'an_' + obj.id);
+      saveActivityNotifs(arr);
+    } catch(e){}
+  }
+  toast(estado==='borrador'?'💾 Borrador guardado en '+courseOf(obj.curso).corto:(cloudOk||!db?'🚀 Actividad publicada en '+courseOf(obj.curso).corto+' y notificada a estudiantes':'⚠️ Guardado local; la nube falló — reintenta')); navigate('curso', obj.curso);
 }
 function delActivity(id){
   if(!confirm('¿Eliminar esta actividad y sus trabajos?')) return;
@@ -1509,6 +1903,7 @@ function delActivity(id){
   const subs = d.submissions.filter(s=>s.activityId===id);
   d.activities=d.activities.filter(a=>a.id!==id); d.submissions=d.submissions.filter(s=>s.activityId!==id); saveStore(d);
   cloudDelete('activities', id);
+  cloudDelete('activity_notifications', 'an_' + id);
   subs.forEach(s=>cloudDelete('submissions', s.id));
   // Borra archivos de Supabase (mejor esfuerzo, no bloquea)
   try{
@@ -1616,12 +2011,24 @@ async function submitWork(activityId){
     nuevos.push({id:'s'+Date.now()+i+'_'+Math.floor(Math.random()*1e4),activityId,estudiante:session.nombre,email:session.email,fecha:now.toISOString(),archivo:f.name,tam:f.size,late,mime:f.mime||mimeForExt(f.name),dataUrl:'',fileUrl,storagePath,grade:(prev && prev.archivo===f.name && prev.grade!=null)?prev.grade:null,feedback:(prev && prev.archivo===f.name)?(prev.feedback||''):'',gradedAt:(prev && prev.archivo===f.name)?(prev.gradedAt||null):null,gradedBy:(prev && prev.archivo===f.name)?(prev.gradedBy||'') :''});
   }
   if(!nuevos.length){ return; }
-  nuevos.forEach(n=>{ try{ d.submissions.push(n); const lite={...n}; if(lite.dataUrl && lite.dataUrl.length>900000) delete lite.dataUrl; cloudSave('submissions', n.id, lite); }catch(e){} });
+  // NUBE PRIMERO para entregas: el docente las ve en cualquier dispositivo.
+  let cloudOkCount = 0;
+  for(const n of nuevos){
+    try {
+      d.submissions.push(n);
+      const lite = Object.assign({}, n);
+      if(lite.dataUrl && lite.dataUrl.length > 900000) delete lite.dataUrl;
+      lite.actualizadoEn = new Date().toISOString();
+      const ok = await cloudSave('submissions', n.id, lite);
+      if(ok) cloudOkCount++;
+    } catch(e){}
+  }
+  if(db && cloudOkCount === 0) toast('⚠️ Se guardó local pero la nube falló. El docente podría no verlo en otro dispositivo. Revisa tu conexión.');
   try{ saveStore(d); }catch(e){
     try{ nuevos.forEach(n=>{ n.dataUrl=''; }); const d2=store(); d2.submissions=d2.submissions.filter(s=>!(s.activityId===activityId&&s.email===session.email)); nuevos.forEach(n=>d2.submissions.push(n)); saveStore(d2); }catch(_){ toast('⚠️ No se pudo guardar (almacenamiento lleno)'); return; }
   }
   pendingFiles=[]; pendingFileHandles=[];
-  toast('✅ Trabajo subido a Supabase');
+  toast(db ? '✅ Trabajo enviado y sincronizado con la nube' : '✅ Trabajo guardado local (sin nube)');
   navigate('confirmacion',activityId);
 }
 function viewConfirmacion(activityId){
@@ -1831,8 +2238,19 @@ function viewNotificaciones(){
     const all = getPwdResets().sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
     const pend = all.filter(r=>r.status==='pendiente').length;
     const grades = getGradeNotifs().sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')).slice(0,30);
+    const broadcasts = getActivityNotifs().sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||'')).slice(0,20);
     return `<h1 class="page-title">🔔 Notificaciones</h1>
-    <p class="page-sub">${all.length} restablecimientos (${pend} pendientes) · ${getGradeNotifs().length} calificaciones notificadas.</p>
+    <p class="page-sub">${all.length} restablecimientos (${pend} pendientes) · ${getGradeNotifs().length} calificaciones notificadas · ${getActivityNotifs().length} avisos de actividad.</p>
+    <div class="alert ${_cloudStatus==='conectado'?'alert-green':'alert-yellow'}" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span style="flex:1;min-width:200px">${_cloudStatus==='conectado'?'☁️ Nube conectada: tus publicaciones y calificaciones llegan a todos los dispositivos en tiempo real.':'⚠️ Estado nube: '+_cloudStatus+'. Pulsa Actualizar y revisa conexión / reglas.'}</span><button class="btn btn-outline btn-sm" onclick="pullAllCloudData(true)">🔄 Actualizar</button></div>
+    <div class="card"><h3>📚 Avisos de actividad enviados</h3>
+      <p class="desc">Cada actividad publicada genera un aviso automático a los estudiantes (llega a cualquier dispositivo).</p>
+      ${!broadcasts.length?'<div class="empty">Aún no hay avisos. Publica una actividad y aparecerá aquí.</div>':
+      `<div class="table-wrap"><table><tr><th>Actividad</th><th>Módulo</th><th>Límite</th><th>Fecha aviso</th></tr>
+      ${broadcasts.map(n=>`<tr><td><b>${escHtml(n.activityTitle)}</b></td>
+        <td>${escHtml(courseOf(n.module).corto||'')}</td>
+        <td><small>${n.limite?fmtFecha(n.limite)+' '+(n.hora||''):''}</small></td>
+        <td><small>${fmtFechaHora(n.createdAt)}</small></td></tr>`).join('')}</table></div>`}
+    </div>
     <div class="card"><h3>⭐ Calificaciones notificadas a estudiantes</h3>
       <p class="desc">Cada vez que calificas un trabajo se le avisa al estudiante automáticamente.</p>
       ${!grades.length?'<div class="empty">Aún no notificas calificaciones. Califica un trabajo y aparecerá aquí.</div>':
@@ -1860,10 +2278,29 @@ function viewNotificaciones(){
   const gAll = myGradeNotifs();
   const gUnread = gAll.filter(n=>!n.read);
   const gRead = gAll.filter(n=>n.read);
+  const aAll = myActivityNotifs();
+  const aUnread = aAll.filter(n=>!n.read);
+  const aRead = aAll.filter(n=>n.read);
   return `<div style="display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap"><div style="flex:1;min-width:200px"><h1 class="page-title">🔔 Mis notificaciones</h1>
-  <p class="page-sub">Te avisamos cuando tu trabajo ya fue calificado y si tu contraseña fue restablecida.</p></div>
+  <p class="page-sub">Te avisamos cuando se publica una actividad, cuando tu trabajo ya fue calificado y si tu contraseña fue restablecida.</p></div>
   <button class="btn btn-outline btn-sm" onclick="pullStudentNotifs(true)">🔄 Actualizar</button></div>
-  ${(!mine.length && !gAll.length)?`<div class="card" style="text-align:center;padding:32px"><div style="font-size:48px">🔕</div><h3>Sin notificaciones</h3><p class="desc">Cuando tu docente califique un trabajo te llegará aquí la nota. Si olvidas tu contraseña, pídele que la restablezca.</p></div>`:''}
+  <div class="alert ${_cloudStatus==='conectado'?'alert-green':'alert-yellow'}" style="margin-bottom:14px">${_cloudStatus==='conectado'?'☁️ Conectado a la nube: tus actividades se sincronizan en tiempo real en todos tus dispositivos.':'⚠️ Estado nube: '+_cloudStatus+'. Si ves este aviso, pulsa 🔄 Actualizar y revisa tu conexión / reglas de Firestore.'}</div>
+  ${(!mine.length && !gAll.length && !aAll.length)?`<div class="card" style="text-align:center;padding:32px"><div style="font-size:48px">🔕</div><h3>Sin notificaciones</h3><p class="desc">Cuando tu docente publique una actividad o califique un trabajo te llegará aquí. Si olvidas tu contraseña, pídele que la restablezca.</p></div>`:''}
+  ${aUnread.length?`<div class="card" style="border-left:5px solid #4f46e5"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h3 style="flex:1;margin:0">📚 Nuevas actividades (${aUnread.length})</h3><button class="btn btn-outline btn-sm" onclick="markAllActivitiesRead()">✅ Marcar todas como leídas</button></div>
+    ${aUnread.map(n=>`
+    <div class="card notif-card" style="border-left-color:#4f46e5">
+      <div class="notif-ico" style="background:#ede9fe">📚</div>
+      <div style="flex:1;min-width:0">
+        <h3 style="margin:0">¡Nueva actividad publicada!</h3>
+        <p class="desc"><b>${escHtml(n.activityTitle)}</b> · ${escHtml(courseOf(n.module).nombre||'')} · ${n.limite?('⏰ Límite: '+fmtFecha(n.limite)+' '+(n.hora||'')):'Sin fecha límite visible'}</p>
+        ${n.descripcion?`<p class="desc">${escHtml(n.descripcion)}</p>`:''}
+        <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+          ${n.activityId?`<button class="btn btn-primary btn-sm" onclick="navigate('actividad','${n.activityId}')">Ver actividad →</button>`:''}
+          <button class="btn btn-outline btn-sm" onclick="markActivityNotifRead('${n.id}')">✅ Marcar como leída</button>
+        </div>
+      </div>
+    </div>`).join('')}</div>`:''}
+  ${aRead.length?`<div class="card"><h3>📜 Actividades anteriores</h3>${aRead.slice(0,10).map(n=>`<div class="file-chip">📚 <b>${escHtml(n.activityTitle)}</b> · ${escHtml(courseOf(n.module).corto||'')}<span style="color:#64748b;font-size:12px">${n.createdAt?fmtFechaHora(n.createdAt):''} · leída</span>${n.activityId?`<button class="btn btn-outline btn-sm" onclick="navigate('actividad','${n.activityId}')">Ver</button>`:''}</div>`).join('')}</div>`:''}
   ${gUnread.length?`<div class="card" style="border-left:5px solid #16a34a"><div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><h3 style="flex:1;margin:0">⭐ Trabajos calificados (${gUnread.length} nuevos)</h3><button class="btn btn-outline btn-sm" onclick="markAllGradesRead()">✅ Marcar todas como leídas</button></div>
     ${gUnread.map(n=>`
     <div class="card notif-card" style="border-left-color:#16a34a">
@@ -1919,7 +2356,7 @@ function pendingGradeBanner(){
   return `<div class="alert alert-green">⭐ <b>Tu trabajo ya fue calificado:</b> ${escHtml(n.activityTitle)} → <b>${n.grade}/20</b>${n.feedback?` · 💬 ${escHtml(n.feedback)}`:''} <button class="btn btn-success btn-sm" onclick="navigate('notificaciones')">Ver notificación →</button>${unread.length>1?` <small>(+${unread.length-1} más)</small>`:''}</div>`;
 }
 function studentAlertBanners(){
-  return pendingPwdBanner() + pendingGradeBanner();
+  return pendingActivityBanner() + pendingPwdBanner() + pendingGradeBanner();
 }
 function viewPerfil(){
   const isDoc=session.rol==='docente';
@@ -1942,6 +2379,15 @@ function viewConfig(){
     <label style="display:flex;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--border)"><input type="checkbox" ${c.resumen?'checked':''} onchange="updCfg('resumen',this.checked)"> 📧 Recibir resumen semanal por correo</label>
     <label style="display:flex;gap:10px;align-items:center;padding:10px 0"><input type="checkbox" ${c.tarde?'checked':''} onchange="updCfg('tarde',this.checked)"> ⏰ Permitir trabajos tardíos por defecto</label>
     <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="toast('✅ Configuración guardada')">Guardar</button><button class="btn btn-outline btn-sm" onclick="if(confirm('¿Borrar TODAS las actividades y trabajos? Empezarás desde cero.')){resetAllData();location.reload()}">🗑 Borrar todo y empezar de cero</button></div>
+  </div>
+  <div class="card"><h3>☁️ Conexión con Firebase / Firestore</h3>
+    <p class="desc">La sincronización multi-dispositivo depende de Firestore. Si un estudiante no ve actividades en otro dispositivo, verifica aquí.</p>
+    <dl class="kv"><dt>Estado</dt><dd><b>${_cloudStatus}</b></dd><dt>Proyecto</dt><dd>${firebaseConfig.projectId}</dd><dt>Última sync</dt><dd>${_lastFullSyncAt ? fmtFechaHora(_lastFullSyncAt) : 'nunca'}</dd><dt>Actividades en caché</dt><dd>${store().activities.length} · Entregas: ${store().submissions.length} · Avisos: ${getActivityNotifs().length}</dd></dl>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+      <button class="btn btn-primary btn-sm" onclick="checkFirebaseConnection().then(r=>{toast(r.ok?'✅ Conectado a Firestore':'⚠️ Falló: '+(r.reason||''));render()})">🔌 Probar conexión</button>
+      <button class="btn btn-outline btn-sm" onclick="pullAllCloudData(true)">🔄 Sincronizar ahora</button>
+    </div>
+    <div class="alert alert-yellow" style="margin:12px 0 0">🔐 Si la prueba dice <b>permission-denied</b>, en Firebase Console → Firestore → Rules permite al menos:<br><code>match /activities/{id} { allow read, write: if request.auth != null; }</code><br><code>match /submissions/{id} { allow read, write: if request.auth != null; }</code><br><code>match /activity_notifications/{id} { allow read, write: if request.auth != null; }</code><br><code>match /grade_notifications/{id} { allow read, write: if request.auth != null; }</code><br><code>match /password_resets/{id} { allow read, write: if request.auth != null; }</code><br><code>match /users/{id} { allow read, write: if request.auth != null; }</code></div>
   </div>`;
 }
 function updCfg(k,v){ const d=store(); d.config[k]=v; saveStore(d); toast('✅ Guardado'); }
