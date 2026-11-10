@@ -12,7 +12,7 @@
 <meta property="og:type" content="website">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=9">
 <!-- Firebase SDK (compat para usar con app.js global) -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -53,13 +53,15 @@
       </div>
       <div class="field" id="regNameField" style="display:none"><label for="regName">Nombre completo</label><input id="regName" placeholder="Ej. Ana Quispe" autocomplete="name"></div>
       <div class="form-grid" id="regGradeRow" style="display:none">
-        <div class="field"><label for="regGrado">Grado</label><select id="regGrado"><option value="">Selecciona…</option><option>1.°</option><option>2.°</option><option>3.°</option><option selected>4.°</option><option>5.°</option></select></div>
-        <div class="field"><label for="regSeccion">Sección</label><select id="regSeccion"><option value="">Selecciona…</option><option>A</option><option selected>B</option><option>C</option><option>D</option><option>E</option></select></div>
+        <div class="field"><label for="regGrado">Grado <span style="color:#dc2626">*</span></label><select id="regGrado" required onchange="this.style.borderColor='';this.style.boxShadow=''"><option value="" selected>Selecciona tu grado…</option><option>1.°</option><option>2.°</option><option>3.°</option><option>4.°</option><option>5.°</option></select></div>
+        <div class="field"><label for="regSeccion">Sección <span style="color:#dc2626">*</span></label><select id="regSeccion" required onchange="this.style.borderColor='';this.style.boxShadow=''"><option value="" selected>Selecciona tu sección…</option><option>A</option><option>B</option><option>C</option><option>D</option><option>E</option></select></div>
       </div>
-      <div class="field"><label for="loginEmail">Correo institucional</label><input id="loginEmail" type="email" value="" placeholder="usuario@colegio.edu" autocomplete="email"></div>
-      <div class="field"><label for="loginPass">Contraseña</label><div class="pass-wrap"><input id="loginPass" type="password" value="" placeholder="Mínimo 6 caracteres" autocomplete="current-password"><button type="button" class="pass-toggle" onclick="togglePassword()" title="Mostrar / ocultar contraseña" aria-label="Mostrar u ocultar contraseña">👁️</button></div><small id="passHint">Firebase: usa tu contraseña real registrada.</small></div>
+      <div class="field"><label for="loginEmail">Correo electrónico</label><input id="loginEmail" type="email" value="" placeholder="tucorreo@ejemplo.com" autocomplete="email"></div>
+      <div class="field" id="regEmail2Field" style="display:none"><label for="regEmail2">Confirmar correo <span style="color:#dc2626">*</span></label><input id="regEmail2" type="email" placeholder="Escríbelo otra vez, exactamente igual"></div>
+      <div class="field"><label for="loginPass">Contraseña</label><div class="pass-wrap"><input id="loginPass" type="password" value="" placeholder="Mínimo 6 caracteres" autocomplete="current-password"><button type="button" class="pass-toggle" onclick="togglePassword()" title="Mostrar / ocultar contraseña" aria-label="Mostrar u ocultar contraseña">👁️</button></div></div>
       <div id="authError" class="alert alert-red" style="display:none"></div>
       <button class="btn btn-primary" id="btnLogin" style="width:100%" onclick="doLogin()">Ingresar →</button>
+      <button class="btn btn-outline" id="btnForgot" style="width:100%;margin-top:8px" onclick="forgotPassword()">🔑 ¿Olvidaste tu contraseña?</button>
       <button class="btn btn-success" id="btnRegister" style="width:100%;display:none" onclick="doRegister()">Crear cuenta ✨</button>
       <p style="text-align:center;font-size:13.5px;margin:12px 0 0">
         <span id="toRegister">¿No tienes cuenta? <a href="#" onclick="toggleAuthMode('register');return false" style="color:var(--primary);font-weight:700">Regístrate aquí</a></span>
@@ -109,6 +111,6 @@ setTimeout(function(){
   }
 },8000);
 </script>
-<script src="app.js"></script>
+<script src="app.js?v=14"></script>
 </body>
 </html>

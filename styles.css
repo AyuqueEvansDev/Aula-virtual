@@ -231,3 +231,38 @@ input,select,textarea{max-width:100%;min-width:0}
   .table-wrap table{min-width:480px}
   .kv{font-size:13.5px}
 }
+
+/* ============ TABLAS REORDENADAS (sin scroll horizontal) ============
+   Uso: <table class="responsive-table"> con data-lab en cada <td>.
+   En pantallas angostas la tabla se apila en "fichas": cada celda
+   muestra su etiqueta encima; nunca aparece scrollbar horizontal. */
+.act-btns{display:flex;gap:6px;flex-wrap:wrap}
+table.responsive-table{min-width:0 !important}
+@media(max-width:860px){
+  table.responsive-table{min-width:0 !important}
+  .responsive-table thead{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+  .responsive-table,.responsive-table tbody,.responsive-table tr,.responsive-table td{display:block;width:100%}
+  .responsive-table tr{padding:10px 4px;border-top:1px solid var(--border)}
+  .responsive-table tr:first-child{border-top:0}
+  .responsive-table td{border-top:0;padding:3px 0}
+  .responsive-table td::before{content:attr(data-lab);display:block;font-size:11px;font-weight:800;color:#64748b;text-transform:uppercase;letter-spacing:.05em;margin-bottom:3px}
+  .responsive-table td:empty::before{content:none}
+  .responsive-table code{overflow-wrap:anywhere}
+}
+
+/* ============ COLUMNAS SIEMPRE VISIBLES (Trabajos de estudiantes) ============
+   Garantiza que las 6 columnas (Estudiante · Estado · Fecha · Archivo ·
+   Nota · Acción) queden dentro del ancho visible en tablet horizontal y
+   laptops angostos: los encabezados pueden envolver a 2 líneas y las
+   insignias también, así la tabla nunca desborda ni genera scrollbar. */
+table.responsive-table th{white-space:normal;line-height:1.25}
+table.responsive-table td{white-space:normal}
+table.responsive-table td:nth-child(4){overflow-wrap:anywhere;word-break:break-word}
+table.responsive-table td b,table.responsive-table td small{overflow-wrap:anywhere}
+table.responsive-table td .badge{white-space:normal}
+table.responsive-table th:nth-child(1),table.responsive-table td:nth-child(1){width:22%;min-width:130px}
+table.responsive-table th:nth-child(2),table.responsive-table td:nth-child(2){width:14%}
+table.responsive-table th:nth-child(3),table.responsive-table td:nth-child(3){width:16%}
+table.responsive-table th:nth-child(4),table.responsive-table td:nth-child(4){width:16%}
+table.responsive-table th:nth-child(5),table.responsive-table td:nth-child(5){width:12%}
+table.responsive-table th:nth-child(6),table.responsive-table td:nth-child(6){width:20%;min-width:150px}

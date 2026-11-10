@@ -92,6 +92,45 @@ function canAccessModule(cid){
   if(!cid || !COURSES[cid]) return true; // legacy u otros: se permite (migración)
   return allowedModulesFor(session).includes(cid);
 }
+/* Filtro por grado de la actividad: si la actividad tiene grado asignado,
+   solo la ven los estudiantes de ese grado (publicada/nuevo aviso/listado). */
+function gradeOkForStudent(a){
+  if(!a || !a.grado) return true;            // sin grado: visible para todos (legacy)
+  if(!session || session.rol!=='estudiante') return true;
+  if(!session.grado) return false;           // sin grado definido: no mezclar
+  return gradoDigito(session.grado) === gradoDigito(a.grado);
+}
+/* Grado asociado a cada módulo (política del colegio):
+   4.º A/B -> Móviles y videojuegos · 5.º A/B -> Ensamblaje y reparación. */
+function gradoDeModulo(cid){
+  if(cid==='moviles') return '4.°';
+  if(cid==='ensamblaje') return '5.°';
+  return '';
+}
+/* MIGRACIÓN AUTOMÁTICA: asigna el grado correspondiente a TODAS las
+   actividades ya creadas (sin volver a crearlas) según su módulo.
+   - Solo actúa si la actividad no tiene un grado definido por el docente
+     (a.gradoAuto === false significa "elegido a mano": no se toca).
+   - Persiste en la nube con set(merge) para no pisar otros campos.
+   Se ejecuta en cada render; es barato si no hay cambios. */
+function migrarGradosActividades(){
+  const d=store();
+  if(!d || !Array.isArray(d.activities)) return 0;
+  const cambios=[];
+  d.activities.forEach(a=>{
+    const target=gradoDeModulo(a.curso);
+    if(!target) return;
+    if(a.gradoAuto===false) return;
+    if(gradoDigito(a.grado)!==gradoDigito(target)){ a.grado=target; a.gradoAuto=true; cambios.push(a); }
+  });
+  if(cambios.length){
+    try{ saveStore(d); }catch(e){ return 0; }
+    cambios.forEach(a=>{
+      try { if(db){ db.collection('activities').doc(a.id).set({ grado:a.grado, gradoAuto:true }, { merge:true }).catch(()=>{}); } else { cloudSave('activities', a.id, a); } } catch(e){}
+    });
+  }
+  return cambios.length;
+}
 function lockedMessage(cid){
   const c = courseOf(cid);
   const allowed = allowedModulesFor(session).map(id => courseOf(id).nombre);
@@ -182,19 +221,25 @@ function fmtFecha(iso){ if(!iso) return '—'; const d=new Date(iso.includes('T'
 function fmtFechaHora(iso){ const d=new Date(iso); return d.toLocaleDateString('es-PE',{day:'2-digit',month:'2-digit',year:'numeric'})+' '+d.toLocaleTimeString('es-PE',{hour:'2-digit',minute:'2-digit'}); }
 function fmtHora12(h){ let [H,M]=h.split(':').map(Number); const ap=H>=12?'p. m.':'a. m.'; H=H%12||12; return `${H}:${String(M).padStart(2,'0')} ${ap}`; }
 function mySubmission(activityId){
-  const s = store().submissions.find(x=>x.activityId===activityId && x.email===session.email);
-  return s||null;
+  const mail=(session.email||'').toLowerCase();
+  const list = store().submissions
+    .filter(x=>x.activityId===activityId && String(x.email||'').toLowerCase()===mail)
+    .sort((a,b)=>String(b.fecha||'').localeCompare(String(a.fecha||'')));
+  return list[0]||null;
 }
 function statusForStudent(a, sub){
   if(a.estado==='borrador') return {key:'borrador', label:'Borrador'};
-  if(sub) return sub.late ? {key:'tarde', label:'Fuera de plazo'} : {key:'presentado', label:'Presentado'};
+  if(sub){
+    if(sub.manual) return {key:'entregam', label:'Calificado (sin entrega)'};
+    return sub.late ? {key:'tarde', label:'Fuera de plazo'} : {key:'presentado', label:'Presentado'};
+  }
   const diff = deadlineOf(a) - new Date();
   if(diff < 0) return {key:'vencido', label:'Vencido'};
   return {key:'pendiente', label:'Pendiente'};
 }
 function badge(st){
-  const map={presentado:'b-green',vencido:'b-red',pendiente:'b-blue',tarde:'b-red',borrador:'b-gray',publicada:'b-green',revisar:'b-yellow'};
-  const dot={presentado:'🟢',vencido:'🔴',pendiente:'🔵',tarde:'⚠️',borrador:'📝',publicada:'🟢',revisar:'🟡'};
+  const map={presentado:'b-green',vencido:'b-red',pendiente:'b-blue',tarde:'b-red',borrador:'b-gray',publicada:'b-green',revisar:'b-yellow',entregam:'b-yellow'};
+  const dot={presentado:'🟢',vencido:'🔴',pendiente:'🔵',tarde:'⚠️',borrador:'📝',publicada:'🟢',revisar:'🟡',entregam:'📝'};
   return `<span class="badge ${map[st.key]||'b-gray'}"><span class="dot"></span>${dot[st.key]||''} ${st.label}</span>`;
 }
 /* ---------- Calificaciones reales (0-20) ---------- */
@@ -238,25 +283,118 @@ function saveGrade(sid){
   s.feedback = (fEl?.value||'').trim();
   s.gradedAt = new Date().toISOString();
   s.gradedBy = session?.email || '';
+  // Trabajo en grupo: replica la misma nota a todos los integrantes
+  const replicados = aplicarNotaAGrupo(d, s);
   saveStore(d);
   cloudSave('submissions', s.id, s);
+  replicados.forEach(r=>{
+    cloudSave('submissions', r.id, r);
+    try { pushGradeNotif(r); } catch(e){}
+  });
   try { pushGradeNotif(s); } catch(e){ console.warn('Notif calificación falló:', e); }
-  toast('✅ Calificación guardada ('+s.grade+'/20) y notificada al estudiante');
+  toast('✅ Calificación guardada ('+s.grade+'/20) y notificada al estudiante' + (replicados.length?` · 🧑‍🤝‍🧑 replicada a ${replicados.length} integrante(s) del grupo`:''));
   render();
+}
+/* ============================================================
+   TRABAJO EN GRUPO — un integrante envía y el docente califica una
+   sola vez: la misma nota se aplica a la entrega de cada miembro.
+   ============================================================ */
+function integrantesDeGrupo(s){
+  try { return (s && s.grupo && Array.isArray(s.integrantes)) ? s.integrantes.map(x=>(x||'').toLowerCase()) : []; } catch(e){ return []; }
+}
+function aplicarNotaAGrupo(d, lider){
+  const miembros = integrantesDeGrupo(lider).filter(m=>m && m!==((lider.email||'').toLowerCase()));
+  if(!lider.grupo || !miembros.length) return [];
+  const out=[];
+  miembros.forEach(m=>{
+    let rec=d.submissions.find(x=>(x.email||'').toLowerCase()===m && x.activityId===lider.activityId);
+    if(!rec){
+      const st=getAllStudents().find(x=>(x.email||'').toLowerCase()===m);
+      rec={ id:'g'+Date.now()+Math.floor(Math.random()*1e4), activityId:lider.activityId, estudiante:(st?st.nombre:(m.split('@')[0]||m)), email:m, fecha:lider.fecha||new Date().toISOString(), archivo:lider.archivo||'', tam:lider.tam||'', late:!!lider.late, mime:lider.mime||'', dataUrl:'', fileUrl:lider.fileUrl||'', storagePath:lider.storagePath||'', grupo:true, grupoNombre:lider.grupoNombre||'', integrantes:lider.integrantes, grupoLider:false, grade:null, feedback:'', gradedAt:null, gradedBy:'' };
+      d.submissions.push(rec);
+    }
+    rec.grade=lider.grade; rec.feedback=lider.feedback; rec.gradedAt=lider.gradedAt; rec.gradedBy=lider.gradedBy;
+    out.push(rec);
+  });
+  return out;
 }
 function clearGrade(sid){
   if(!confirm('¿Quitar la calificación de este trabajo?')) return;
   const d = store();
   const s = d.submissions.find(x=>x.id===sid);
   if(!s) return;
+  // Grupo: quita la nota también de los integrantes (mismo estado que antes)
+  const grupoMisma = d.submissions.filter(x=>x.id!==s.id && x.activityId===s.activityId && x.grupo && x.email!==s.email && ((integrantesDeGrupo(x).join('||'))===(integrantesDeGrupo(s).join('||'))) && integrantesDeGrupo(s).length);
   s.grade = null; s.feedback=''; s.gradedAt=null; s.gradedBy='';
+  grupoMisma.forEach(r=>{ r.grade=null; r.feedback=''; r.gradedAt=null; r.gradedBy=''; });
   saveStore(d);
   cloudSave('submissions', s.id, s);
+  grupoMisma.forEach(r=>{ cloudSave('submissions', r.id, r); });
   try {
     const arr = getGradeNotifs().filter(n => n.submissionId !== sid || n.read);
     saveGradeNotifs(arr);
   } catch(e){}
   toast('🗑 Calificación eliminada'); render();
+}
+/* ============================================================
+   CALIFICACIÓN MANUAL SIN ENTREGA — el docente puede registrar
+   la nota de un estudiante aunque no haya presentado la actividad.
+   Se crea un registro de entrega "manual" (sin archivo) para que la
+   nota, el promedio y las notificaciones funcionen igual que siempre.
+   ============================================================ */
+function viewEntregaManual(param){
+  const sep = (param||'').indexOf('|');
+  const aid = sep>=0 ? param.slice(0,sep) : '';
+  const email = sep>=0 ? param.slice(sep+1) : '';
+  const a=store().activities.find(x=>x.id===aid);
+  if(!a) return '<div class="card">Actividad no encontrada.</div>';
+  const st=getAllStudents().find(x=>x.email===email);
+  if(!st) return '<div class="card">Estudiante no encontrado.</div>';
+  const s=store().submissions.find(x=>x.activityId===aid && x.email===email);
+  const g = s ? gradeOf(s) : null;
+  const fecha = fmtFechaHora(new Date().toISOString());
+  return `<button class="btn btn-outline btn-sm" onclick="navigate('entregas','${a.id}')">← Volver a trabajos</button>
+  <div class="card" style="margin-top:12px"><h2>⭐ Calificar sin entrega</h2><p class="desc">Registra la nota de un estudiante que no presentó la actividad. La nota se guarda y el estudiante la verá en su cuenta (Mis trabajos, actividad y perfil).</p>
+  <dl class="kv"><dt>Estudiante</dt><dd><b>${escHtml(st.nombre)}</b> (${escHtml(st.email)})</dd><dt>Actividad</dt><dd>${escHtml(a.titulo)}</dd><dt>Módulo</dt><dd>${courseOf(a.curso).nombre}</dd><dt>Límite</dt><dd>${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</dd><dt>Entrega</dt><dd>⚠️ Sin archivo presentado</dd>${s&&g!=null?`<dt>Nota actual</dt><dd>${gradeBadge(s)}${s.gradedAt?` <small style="color:#64748b">(${fmtFechaHora(s.gradedAt)})</small>`:''}</dd>`:''}</dl></div>
+  <div class="card"><h3>⭐ Registrar calificación</h3>
+    <div class="form-grid">
+      <div class="field"><label>Nota (0 – 20)</label><input id="gradeInput" type="number" min="0" max="20" step="0.5" value="${g!=null?g:''}" placeholder="Ej. 0"></div>
+      <div class="field"><label>Comentario / retroalimentación</label><input id="gradeFeedback" value="${escHtml(s?s.feedback:'')}" placeholder="Ej. No presentó la actividad"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn btn-success btn-sm" onclick="saveManualGrade('${a.id}','${escJs(st.email)}')">✅ Guardar calificación</button>
+      ${s&&g!=null?`<button class="btn btn-outline btn-sm" onclick="clearGrade('${s.id}')">🗑 Quitar nota</button>`:''}
+    </div>
+  </div>`;
+}
+function saveManualGrade(aid, email){
+  const gEl = document.getElementById('gradeInput');
+  const fEl = document.getElementById('gradeFeedback');
+  if(!gEl){ return; }
+  const raw = (gEl.value||'').trim();
+  if(raw===''){ toast('⚠️ Escribe una nota de 0 a 20'); return; }
+  const n = Number(raw);
+  if(isNaN(n) || n<0 || n>20){ toast('⚠️ La nota debe estar entre 0 y 20'); return; }
+  const d = store();
+  const a = d.activities.find(x=>x.id===aid);
+  if(!a){ toast('⚠️ Actividad no encontrada'); return; }
+  const st = getAllStudents().find(x=>x.email===email);
+  if(!st){ toast('⚠️ Estudiante no encontrado'); return; }
+  const now = new Date().toISOString();
+  let s = d.submissions.find(x=>x.activityId===aid && x.email===email && x.manual);
+  if(!s){
+    s = { id:'m'+Date.now()+'_'+Math.floor(Math.random()*1e4), activityId:aid, estudiante:st.nombre, email:st.email, fecha:now, archivo:'(sin entrega)', tam:'—', late:false, manual:true, grade:null, feedback:'', gradedAt:null, gradedBy:'' };
+    d.submissions.push(s);
+  }
+  s.grade = Math.round(n*100)/100;
+  s.feedback = (fEl?.value||'').trim();
+  s.gradedAt = now;
+  s.gradedBy = session?.email || '';
+  saveStore(d);
+  cloudSave('submissions', s.id, s);
+  try { pushGradeNotif(s); } catch(e){ console.warn('Notif calificación manual falló:', e); }
+  toast('✅ Calificación guardada ('+s.grade+'/20) sin entrega y notificada al estudiante');
+  render();
 }
 /* ============================================================
    NOTIFICACIONES DE CALIFICACIÓN — avisan al estudiante cuando
@@ -534,6 +672,12 @@ function myActivityNotifs(){
   try { deleted = getDeletedActivityIds(); valid = validActivityIdSet(); } catch(e){}
   return getActivityNotifs()
     .filter(n => canAccessModule(n.module || n.curso || ''))
+    .filter(n => {
+      const aid = n.activityId || (n.id || '').replace(/^an_/, '');
+      const act = store().activities.find(x=>x.id===aid);
+      if(act && !gradeOkForStudent(act)) return false; // aviso solo de su grado
+      return true;
+    })
     .filter(n => {
       const aid = n.activityId || (n.id || '').replace(/^an_/, '');
       if(aid && deleted && (deleted.has(aid) || deleted.has(n.id))) return false;
@@ -819,7 +963,7 @@ async function detectNewActivityAlert(){
     const deleted = getDeletedActivityIds();
     const known = new Set(getActivityNotifs().map(n => n.activityId));
     const fresh = store().activities.filter(a =>
-      a.estado === 'publicada' && !known.has(a.id) && !deleted.has(a.id) && canAccessModule(a.curso));
+      a.estado === 'publicada' && !known.has(a.id) && !deleted.has(a.id) && canAccessModule(a.curso) && gradeOkForStudent(a));
     for(const a of fresh.slice(0, 5)){
       await pushActivityBroadcastStudentSide(a);
     }
@@ -986,6 +1130,7 @@ function downloadFile(name){
 function downloadSubmission(sid){
   const s = store().submissions.find(x => x.id === sid);
   if(!s){ toast('⚠️ Trabajo no encontrado'); return; }
+  if(s.manual){ toast('⚠️ Este registro no tiene archivo (calificación sin entrega)'); return; }
   if(s.fileUrl){ openSafe(s.fileUrl); return; } // original en Supabase
   if(s.dataUrl){
     try { saveBlob(dataUrlToBytes(s.dataUrl), s.mime || mimeForExt(s.archivo), s.archivo); return; }
@@ -1034,23 +1179,28 @@ function switchRole(r){
   if (authMode === 'login') {
     document.getElementById('loginEmail').value = '';
   }
+  const passInp = document.getElementById('loginPass');
+  if(passInp){ passInp.value = ''; passInp.type = 'password'; const tgl=document.querySelector('.pass-toggle'); if(tgl) tgl.textContent='👁️'; }
+  hideAuthError();
   updateGradeVisibility();
 }
 function toggleAuthMode(mode){
   authMode = mode;
   const isReg = mode === 'register';
   document.getElementById('regNameField').style.display = isReg ? '' : 'none';
+  const f2 = document.getElementById('regEmail2Field');
+  if(f2) f2.style.display = isReg ? '' : 'none';
+  const f2i = document.getElementById('regEmail2');
+  if(f2i) f2i.value = '';
   document.getElementById('btnLogin').style.display = isReg ? 'none' : '';
   document.getElementById('btnRegister').style.display = isReg ? '' : 'none';
   document.getElementById('toRegister').style.display = isReg ? 'none' : '';
   document.getElementById('toLogin').style.display = isReg ? '' : 'none';
   document.getElementById('authTitle').textContent = isReg ? 'Crear cuenta' : 'Iniciar sesión';
   document.getElementById('authSub').textContent = isReg
-    ? 'Regístrate como docente o estudiante. Se guardará en Firebase.'
+    ? 'Regístrate como docente o estudiante.'
     : 'Accede según tu rol: docente o estudiante.';
-  document.getElementById('passHint').textContent = isReg
-    ? 'Mínimo 6 caracteres (lo exige Firebase).'
-    : 'Firebase: usa tu contraseña real registrada.';
+  const ph = document.getElementById('passHint'); if(ph) ph.style.display = 'none';
   updateGradeVisibility();
   hideAuthError();
 }
@@ -1065,6 +1215,9 @@ function hideAuthError(){
 }
 function friendlyAuthError(err){
   if(!err || !err.code) return 'Error de autenticación.';
+  // Firestore Security Rules: traduce el error crudo a una instrucción útil
+  if(err.code === 'permission-denied')
+    return '🔐 Firestore bloqueó el acceso ("Missing or insufficient permissions"). En Firebase Console → Firestore Database → Rules, publica: allow read, write: if request.auth != null; para todas las colecciones, pulsa Publicar y vuelve a intentar.';
   const map = {
     'auth/email-already-in-use': '⚠️ Ese correo ya está registrado. Inicia sesión.',
     'auth/invalid-email': '⚠️ Correo no válido.',
@@ -1078,12 +1231,57 @@ function friendlyAuthError(err){
   };
   return map[err.code] || ('⚠️ ' + (err.message || 'Error de Firebase.'));
 }
+/* ============================================================
+   CONTRASEÑA OLVIDADA — mecanismo nativo de Firebase Auth:
+   envía un correo con enlace para crear contraseña nueva.
+   El "restablecimiento por temporal" del docente NO cambia la
+   contraseña de Auth (no es posible desde el SDK del cliente),
+   así que el correo es la vía real cuando el estudiante no puede
+   entrar. También se envía automáticamente al resetear docente.
+   ============================================================ */
+async function forgotPassword(){
+  hideAuthError();
+  const emailInput = document.getElementById('loginEmail');
+  const email = ((emailInput?.value) || '').trim();
+  if(!email){
+    showAuthError('⚠️ Escribe primero tu correo electrónico arriba y pulsa de nuevo «¿Olvidaste tu contraseña?».');
+    emailInput?.focus();
+    return;
+  }
+  const btn = document.getElementById('btnForgot');
+  if(btn){ btn.disabled = true; btn.textContent = 'Enviando…'; }
+  try {
+    await auth.sendPasswordResetEmail(email);
+    showAuthError('📧 Se envió un correo de restablecimiento a ' + email + '. Revisa tu bandeja (y la carpeta de spam) y sigue el enlace para crear tu contraseña nueva.');
+    toast('📧 Correo de restablecimiento enviado');
+  } catch(err){
+    console.error('forgotPassword:', err);
+    const msgs = {
+      'auth/user-not-found': '⚠️ Ese correo no está registrado. Pide a tu docente que verifique el correo en 👥 Estudiantes.',
+      'auth/invalid-email': '⚠️ Correo no válido.',
+      'auth/network-request-failed': '⚠️ Sin conexión a Firebase. Revisa tu internet.',
+      'auth/operation-not-allowed': '⚠️ Habilita Email/Password en Firebase Console → Authentication → Sign-in method.',
+      'auth/too-many-requests': '⚠️ Demasiados intentos. Espera un momento.'
+    };
+    showAuthError(msgs[err.code] || ('⚠️ No se pudo enviar el correo: ' + (err.code || err.message || '')));
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '🔑 ¿Olvidaste tu contraseña?'; }
+  }
+}
 
 // Registro real en Firebase Auth + guarda perfil en Firestore users/{uid}
 async function doRegister(){
   hideAuthError();
   const nombre = (document.getElementById('regName').value || '').trim();
   const email = (document.getElementById('loginEmail').value || '').trim();
+  // Anti-typo: el correo debe confirmarse (los errores aquí hacen
+  // irrecuperable la cuenta por correo)
+  const email2 = (document.getElementById('regEmail2')?.value || '').trim();
+  if(email2 && email2.toLowerCase() !== email.toLowerCase()){
+    showAuthError('⚠️ Los correos no coinciden. Verifica que sea un correo REAL que puedes revisar (aquí llegarán los avisos y el restablecimiento).');
+    const el=document.getElementById('regEmail2'); el?.focus();
+    return;
+  }
   const pass = document.getElementById('loginPass').value || '';
   const grado = (document.getElementById('regGrado')?.value || '').trim();
   const seccion = (document.getElementById('regSeccion')?.value || '').trim();
@@ -1091,8 +1289,16 @@ async function doRegister(){
   if(!email){ showAuthError('⚠️ Escribe tu correo.'); return; }
   if(pass.length < 6){ showAuthError('⚠️ La contraseña debe tener al menos 6 caracteres.'); return; }
   if(currentRole === 'estudiante'){
-    if(!grado){ showAuthError('⚠️ Selecciona tu grado.'); return; }
-    if(!seccion){ showAuthError('⚠️ Selecciona tu sección.'); return; }
+    if(!grado){
+      showAuthError('⚠️ Selecciona tu grado para completar el registro.');
+      const sel=document.getElementById('regGrado'); if(sel){ sel.style.borderColor='#dc2626'; sel.style.boxShadow='0 0 0 3px rgba(220,38,38,.15)'; sel.focus(); }
+      return;
+    }
+    if(!seccion){
+      showAuthError('⚠️ Selecciona tu sección para completar el registro.');
+      const sel=document.getElementById('regSeccion'); if(sel){ sel.style.borderColor='#dc2626'; sel.style.boxShadow='0 0 0 3px rgba(220,38,38,.15)'; sel.focus(); }
+      return;
+    }
   }
   if(!auth || !db){ showAuthError('⚠️ Firebase no cargó. Revisa tu conexión.'); return; }
   const btn = document.getElementById('btnRegister');
@@ -1150,20 +1356,36 @@ async function doLogin(){
     }
     rememberExtraUser(perfil);
     enterApp({ nombre: perfil.nombre, email: perfil.email, rol: perfil.rol, grado: perfil.grado || '', seccion: perfil.seccion || '', curso: perfil.curso || '', uid });
-  } catch (err) { console.error(err); showAuthError(friendlyAuthError(err)); }
+  } catch (err) {
+    console.error(err);
+    let msg = friendlyAuthError(err);
+    // Fallo de credenciales: sugiere la recuperación real por correo
+    if(err.code === 'auth/invalid-credential' || err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found')
+      msg += ' Si olvidaste tu contraseña, pulsa «🔑 ¿Olvidaste tu contraseña?» con tu correo personal y sigue el enlace que te llegue.';
+    showAuthError(msg);
+  }
   finally { btn.disabled = false; btn.textContent = 'Ingresar →'; }
 }
 
 // Guarda usuarios registrados localmente (caché del roster real de Firestore)
-function rememberExtraUser(perfil){
+function upsertExtraUser(mail, patch){
   try {
     const key = 'eduaula_users_extra';
     const arr = JSON.parse(localStorage.getItem(key) || '[]');
-    const i = arr.findIndex(u => u.email.toLowerCase() === perfil.email.toLowerCase());
-    const row = { nombre: perfil.nombre, email: perfil.email.toLowerCase(), grado: perfil.grado || '', seccion: perfil.seccion || '', rol: perfil.rol };
-    if(i >= 0) arr[i] = row; else arr.push(row);
+    const m = (mail||'').toLowerCase();
+    const i = arr.findIndex(u => (u.email||'').toLowerCase() === m);
+    if(i >= 0) arr[i] = { ...arr[i], ...patch, email: arr[i].email };
+    else arr.push({ nombre:'', email:m, grado:'', seccion:'', rol:'estudiante', ...patch, email:m });
     localStorage.setItem(key, JSON.stringify(arr));
   } catch(e){}
+}
+function rememberExtraUser(perfil){
+  upsertExtraUser(perfil.email, {
+    nombre: perfil.nombre || '',
+    grado: perfil.grado || '',
+    seccion: perfil.seccion || '',
+    rol: perfil.rol
+  });
 }
 // Roster REAL: registrados + quienes ya presentaron trabajos. Sin simulados.
 function getAllStudents(){
@@ -1181,6 +1403,27 @@ function getAllStudents(){
     });
   } catch(e){}
   return [...map.values()];
+}
+/* Espejo BD -> caché: trae la ficha (grado/sección/nombre) de TODOS los
+   estudiantes desde Firestore `users` y la refleja en `eduaula_users_extra`.
+   Así cualquier dispositivo docente ve el roster actualizado sin esperar
+   a que cada estudiante inicie sesión en él. */
+async function pullUsersFromCloud(){
+  if(!db) return 0;
+  const snap = await db.collection('users').get();
+  let changed = 0;
+  snap.forEach(doc=>{
+    const u = doc.data();
+    if((u.rol||'') !== 'estudiante' || !u.email) return;
+    const mail = String(u.email).toLowerCase();
+    const row = { nombre: u.nombre || mail, email: mail, grado: u.grado || '', seccion: u.seccion || '', rol: 'estudiante' };
+    const cur = getCachedUserByEmail(mail);
+    if(!cur || (cur.nombre||'')!==row.nombre || (cur.grado||'')!==row.grado || (cur.seccion||'')!==row.seccion){
+      upsertExtraUser(mail, row);
+      changed++;
+    }
+  });
+  return changed;
 }
 
 /* ============================================================
@@ -1251,15 +1494,16 @@ function copyTempPwd(text){
     }
   } catch(e){ toast('⚠️ No se pudo copiar'); }
 }
-/* Docente restablece: genera temporal + crea notificación pendiente. */
-function resetStudentPassword(email){
+/* Docente restablece: genera temporal + notificación + correo nativo
+   de restablecimiento (Auth), que es lo que permite volver a entrar. */
+async function resetStudentPassword(email){
   if(!session || session.rol !== 'docente'){ toast('⛔ Solo el docente puede restablecer.'); return; }
   const all = getAllStudents();
   const st = all.find(s => s.email.toLowerCase() === (email || '').toLowerCase());
   if(!st){ toast('⚠️ Estudiante no encontrado'); return; }
   const pending = getPendingReset(st.email);
   if(pending && !confirm(`"${st.nombre}" ya tiene una temporal pendiente (${pending.tempPassword}). ¿Generar una nueva y reemplazarla?`)) return;
-  if(!pending && !confirm(`¿Restablecer la contraseña de ${st.nombre} (${st.email})?\nSe generará una temporal y se le notificará.`)) return;
+  if(!pending && !confirm(`¿Restablecer la contraseña de ${st.nombre} (${st.email})?\nSe generará una temporal, se le notificará y llegará un CORREO de restablecimiento a su correo personal (${st.email}). Debe revisar su bandeja y spam.`)) return;
   const temp = genTempPassword();
   const prevPend = getPwdResets().filter(r => r.studentEmail.toLowerCase() === st.email.toLowerCase() && r.status === 'pendiente');
   prevPend.forEach(r => cloudDelete('password_resets', r.id));
@@ -1272,12 +1516,27 @@ function resetStudentPassword(email){
     tempPassword: temp,
     status: 'pendiente', decision: null,
     createdBy: session.email || '', createdAt: new Date().toISOString(),
-    resolvedAt: null
+    resolvedAt: null, emailSent: false
   };
+  // Correo nativo de Firebase: el estudiante podrá crear su contraseña
+  // SIN la anterior (la temporal solo sirve si ya puede entrar).
+  try {
+    await auth.sendPasswordResetEmail(st.email);
+    reset.emailSent = true;
+  } catch(e){
+    console.warn('sendPasswordResetEmail falló:', e);
+    if(e && e.code === 'auth/user-not-found'){
+      toast('🚫 Ese correo NO existe en Firebase (cuenta inexistente o creada offline): por él no llegará nada. El estudiante debe registrarse de nuevo con un correo REAL.');
+      render();
+      return;
+    }
+  }
   arr.push(reset);
   savePwdResets(arr);
   cloudSave('password_resets', reset.id, reset);
-  toast('🔑 Temporal generada y notificada al estudiante');
+  toast(reset.emailSent
+    ? '🔑 Temporal generada y 📧 correo enviado. Confirma con el estudiante que le llegó; si tras unos minutos NO llega, su correo puede estar mal escrito → habrá que crear la cuenta de nuevo con un correo real.'
+    : '🔑 Temporal generada y notificada (⚠️ el correo no pudo enviarse: revisa el buzón del estudiante)');
   render();
 }
 /* Estudiante decide: 'conservar' la temporal o 'nueva' personalizada. */
@@ -1317,8 +1576,8 @@ async function studentResolveReset(resetId, mode){
   savePwdResets(arr);
   cloudSave('password_resets', r.id, r);
   toast(mode === 'nueva'
-    ? (applied ? '✅ Nueva contraseña creada y aplicada' : '✅ Decisión guardada: usarás tu nueva contraseña (vuelve a ingresar con ella)')
-    : (applied ? '✅ Contraseña temporal conservada y aplicada' : '✅ Decisión guardada: conservarás la temporal'));
+    ? (applied ? '✅ Nueva contraseña creada y aplicada' : '⚠️ Decisión guardada, pero Firebase NO aplicó tu contraseña (requiere sesión reciente). Cierra sesión y usa «¿Olvidaste tu contraseña?» en el login para recibirla por correo.')
+    : (applied ? '✅ Contraseña temporal conservada y aplicada' : '⚠️ Decisión guardada, pero Firebase NO aplicó la temporal. Cierra sesión y usa «¿Olvidaste tu contraseña?» en el login.'));
   render();
 }
 /* Reenviar / marcar pendiente de nuevo (docente). */
@@ -1431,6 +1690,7 @@ async function pullActivitiesFromCloud(){
   if(changed || merged.length !== d.activities.length){
     d.activities = merged;
     try { saveStore(d); } catch(e){}
+    try { migrarGradosActividades(); } catch(e){}
     // Al podar actividades, podar también sus avisos huérfanos.
     try { pruneOrphanActivityNotifs(new Set(merged.map(a => a.id)), deleted); } catch(e){}
     return 1;
@@ -1507,12 +1767,52 @@ async function pullSubmissionsFromCloud(){
     if(merged.length !== before) changed++;
   } catch(e){}
   const prevLen = d.submissions.length;
+  const dd = dedupeSubList(merged);
+  if(dd.stale.length){
+    merged = dd.list;
+    // Duplicados viejos de resubidas: fuera de Firestore también (1 vez por sesión docente)
+    if(session.rol==='docente' && db && !dedupeSubmissions._cloudPurged){
+      dedupeSubmissions._cloudPurged = true;
+      dd.stale.forEach(x=>{ if(x.id) cloudDelete('submissions', x.id); });
+    }
+    changed++;
+  }
   if(changed || merged.length !== prevLen){
     d.submissions = merged;
     try { saveStore(d); } catch(e){}
     return 1;
   }
   return 0;
+}
+/* --- Anti-duplicados de entregas -------------------------------
+   Regla: UNA entrega vigente por (estudiante, actividad). Si existen
+   varios registros (resubidas de antes del arreglo), se conserva el
+   más reciente por fecha y el resto se elimina; con purgeCloud=true
+   (docente) también se borra de Firestore para no resucitarse. */
+function dedupeSubList(list){
+  const clean=[]; const stale=[];
+  const byKey=new Map();
+  const sorted=list.slice().sort((a,b)=>String(a.fecha||'').localeCompare(String(b.fecha||'')));
+  sorted.forEach(s=>{
+    const key=(s.activityId||'')+'|'+String(s.email||'').toLowerCase();
+    const cur=byKey.get(key);
+    if(cur){ stale.push(cur); clean.splice(clean.indexOf(cur),1); }
+    byKey.set(key,s); clean.push(s);
+  });
+  return { list: clean, stale };
+}
+function dedupeSubmissions(purgeCloud){
+  try{
+    const d=store();
+    const { list, stale } = dedupeSubList(d.submissions);
+    if(!stale.length) return 0;
+    d.submissions = list;
+    try{ saveStore(d); }catch(e){}
+    if(purgeCloud && db){
+      stale.forEach(x=>{ if(x.id) cloudDelete('submissions', x.id); });
+    }
+    return stale.length;
+  }catch(e){ return 0; }
 }
 /* Sincronización total post-login + botón Actualizar.
    Orden importa: lápidas → actividades → avisos (para podar huérfanas
@@ -1531,6 +1831,10 @@ async function pullAllCloudData(manual){
     try { changed += await pullActivityNotifsFromCloud() ? 1 : 0; } catch(e){ console.warn('pull actNotifs:', e); }
     try { changed += await pullGradeNotifsFromCloud().catch(()=>0) ? 1 : 0; } catch(e){}
     try { changed += await pullPwdResetsFromCloud().catch(()=>0) ? 1 : 0; } catch(e){}
+    // Roster fresco desde la BD: grado/sección editados aparecen en caliente
+    try { changed += await pullUsersFromCloud().catch(()=>0) ? 1 : 0; } catch(e){ console.warn('pull users:', e); }
+    // Último archivo por estudiante: elimina duplicados históricos (local + nube si soy docente)
+    try { dedupeSubmissions(session.rol==='docente'); } catch(e){}
     // Poda final de seguridad: nada borrado revive desde caché/localStorage.
     // Solo se conservan datos de actividades vigentes (relación por ID).
     try {
@@ -1583,6 +1887,7 @@ function subscribeRealtime(){
         if(changed){
           d.activities = [...byId.values()];
           try { saveStore(d); } catch(e){}
+          try { migrarGradosActividades(); } catch(e){}
           // Si una actividad se eliminó en otro dispositivo, su aviso no
           // debe quedarse colgado: pódalo del caché local de inmediato.
           try {
@@ -1643,7 +1948,7 @@ function subscribeRealtime(){
           else { const cur = byId.get(ch.doc.id); if(!cur || JSON.stringify(cur) !== JSON.stringify(data)){ byId.set(ch.doc.id, data); changed = true; } }
         });
         if(changed){
-          d.submissions = [...byId.values()];
+          d.submissions = dedupeSubList([...byId.values()]).list;
           try{ saveStore(d); }catch(e){}
           try { pruneOrphanSubmissions(validActivityIdSet(), getDeletedActivityIds()); } catch(e){}
           render();
@@ -1680,6 +1985,10 @@ function subscribeRealtime(){
       _unsubs.push(db.collection('grade_notifications').onSnapshot(async () => {
         try { const c = await pullGradeNotifsFromCloud().catch(()=>0); if(c) render(); else refreshNavBadge(); } catch(e){}
       }, err => console.warn('RT grades error:', err)));
+      // 5) Roster en vivo: grado/sección editados en otro dispositivo
+      _unsubs.push(db.collection('users').onSnapshot(async () => {
+        try { await pullUsersFromCloud(); if(route==='estudiantes') renderEstudiantesRows(); } catch(e){}
+      }, err => console.warn('RT users error:', err)));
     }
     if(session.rol === 'estudiante'){
       const mail = session.email;
@@ -1951,6 +2260,8 @@ function onGlobalSearch(v){
 
 /* ---------- render dispatcher ---------- */
 function render(){
+  // Migración por módulo: actividad existente -> grado correspondiente (4.º=Móviles, 5.º=Ensamblaje)
+  try { migrarGradosActividades(); } catch(e){}
   const v=document.getElementById('view');
   try { refreshNavBadge(); } catch(e){}
   // Sincronización continua: tanto docente (ver entregas de otros
@@ -1967,9 +2278,12 @@ function render(){
     if(route==='actividades'){ v.innerHTML=viewActividades(''); renderActividades(''); return; }
     if(route==='crear'){ v.innerHTML=viewCrear(null, COURSES[routeParam] ? routeParam : null); updPreview(); return; }
     if(route==='editar'){ v.innerHTML=viewCrear(routeParam); updPreview(); return; }
-    if(route==='entregas'){ v.innerHTML=viewEntregas(); renderEntregasRows(routeParam||store().activities.filter(a=>a.estado==='publicada')[0]?.id||store().activities[0]?.id); return; }
+    if(route==='entregas'){ v.innerHTML=viewEntregas(); renderEntregasRows(routeParam); return; }
     if(route==='entrega-detalle') return v.innerHTML=viewEntregaDetalle(routeParam);
+    if(route==='entrega-manual') return v.innerHTML=viewEntregaManual(routeParam);
     if(route==='estudiantes'){ v.innerHTML=viewEstudiantes(); renderEstudiantesRows(); return; }
+    if(route==='estudiante-editar') return v.innerHTML=viewEstudianteEditar(routeParam);
+    if(route==='estudiante-eliminar') return v.innerHTML=viewEstudianteEliminar(routeParam);
     if(route==='notificaciones') return v.innerHTML=viewNotificaciones();
     if(route==='perfil') return v.innerHTML=viewPerfil();
     if(route==='config') return v.innerHTML=viewConfig();
@@ -1990,8 +2304,8 @@ function render(){
 function visibleActivities(){
   const {activities}=store();
   if(session.rol==='docente') return activities;
-  // Estudiante: solo publicadas Y de módulos habilitados para su grado/sección
-  return activities.filter(a=>a.estado==='publicada' && canAccessModule(a.curso));
+  // Estudiante: solo publicadas, de módulos habilitados Y de su grado
+  return activities.filter(a=>a.estado==='publicada' && canAccessModule(a.curso) && gradeOkForStudent(a));
 }
 
 /* ---------- 4. Dashboard docente ---------- */
@@ -2009,8 +2323,11 @@ function viewDashDocente(){
     return true;
   });
   const total=activities.length;
-  const recibidas=liveSubs.length;
-  const pendientes=new Set(activities.filter(a=>a.estado==='publicada').map(a=>a.id)).size*getAllStudents().length - recibidas;
+  const recibidas=new Set(liveSubs.map(s=>s.email)).size;
+  // Pendientes: solo cuenta estudiantes del grado de cada actividad publicada
+  const cuotaGrados=activities.filter(a=>a.estado==='publicada')
+    .reduce((acc,a)=>acc+((a.grado)?getAllStudents().filter(st=>!st.grado||gradoDigito(st.grado)===gradoDigito(a.grado)).length:getAllStudents().length),0);
+  const pendientes=Math.max(0, cuotaGrados-recibidas);
   const publicadas=activities.filter(a=>a.estado==='publicada').length;
   const recientes=[...activities].slice(-4).reverse();
   if(total===0){
@@ -2055,7 +2372,7 @@ function viewDashDocente(){
     </div>
     <div class="card">
       <h3>📤 Últimos trabajos</h3><p class="desc">Trabajos recibidos recientemente.</p>
-      ${liveSubs.slice(-4).reverse().map(s=>`<div class="file-chip">📄 <b>${escHtml(s.estudiante)}</b> · ${escHtml(s.archivo)} ${gradeOf(s)!=null?`· ⭐ ${gradeOf(s)}/20`:''}<br><small style="color:#64748b">${fmtFechaHora(s.fecha)} ${s.late?'· ⚠️ tardía':''}</small><button class="btn btn-outline btn-sm" onclick="downloadSubmission('${s.id}')">Descargar</button></div>`).join('')||'<div class="empty">Sin trabajos todavía. Aparecerán aquí cuando los estudiantes presenten.</div>'}
+      ${liveSubs.filter(s=>!s.manual).slice(-4).reverse().map(s=>`<div class="file-chip">📄 <b>${escHtml(s.estudiante)}</b> · ${escHtml(s.archivo)} ${gradeOf(s)!=null?`· ⭐ ${gradeOf(s)}/20`:''}<br><small style="color:#64748b">${fmtFechaHora(s.fecha)} ${s.late?'· ⚠️ tardía':''}</small><button class="btn btn-outline btn-sm" onclick="downloadSubmission('${s.id}')">Descargar</button></div>`).join('')||'<div class="empty">Sin trabajos todavía. Aparecerán aquí cuando los estudiantes presenten.</div>'}
       <div style="margin-top:12px"><button class="btn btn-outline btn-sm" onclick="navigate('entregas')">Abrir trabajos de estudiantes →</button></div>
     </div>
   </div>`;
@@ -2080,7 +2397,7 @@ function viewDashEst(){
   acts.forEach(a=>{ const s=statusForStudent(a,mySubmission(a.id)); if(s.key==='presentado')pres++; else if(s.key==='vencido'||s.key==='tarde')venc++; else pend++; });
   const actsById = {};
   store().activities.forEach(a => { actsById[a.id] = a; });
-  const mySubs = store().submissions.filter(s=>s.email===session.email && actsById[s.activityId] && canAccessModule(actsById[s.activityId].curso));
+  const mySubs = store().submissions.filter(s=>String(s.email||'').toLowerCase()===(session.email||'').toLowerCase() && actsById[s.activityId] && canAccessModule(actsById[s.activityId].curso));
   const prom = avgProm(mySubs);
   const upcoming=acts.map(a=>({a,sub:mySubmission(a.id)})).filter(x=>!x.sub && deadlineOf(x.a)-new Date()>0).sort((x,y)=>deadlineOf(x.a)-deadlineOf(y.a)).slice(0,4);
   const graded = acts.map(a=>({a,sub:mySubmission(a.id)})).filter(x=>x.sub && gradeOf(x.sub)!=null).slice(-4).reverse();
@@ -2162,7 +2479,7 @@ function viewCursoDetalle(cid){
     const n=store().submissions.filter(s=>s.activityId===a.id).length;
     return `<div class="activity-item" onclick="navigate('actividad','${a.id}')" style="cursor:pointer">
       <div class="act-ico" style="background:#f1f5f9">📄</div>
-      <div class="act-info"><b>${escHtml(a.titulo)}</b><small>📅 Pub: ${fmtFecha(a.publicacion)} · ⏰ Límite: ${fmtFecha(a.limite)} ${fmtHora12(a.hora)} ${session.rol==='docente'?'· 📥 '+n+' entregas':''}</small></div>${badge(st)}</div>`;
+      <div class="act-info"><b>${escHtml(a.titulo)}</b><small>📅 Pub: ${fmtFecha(a.publicacion)} · ⏰ Límite: ${fmtFecha(a.limite)} ${fmtHora12(a.hora)} ${session.rol==='docente'?'· 📥 '+n+' entregas':''}${a.grado?` · 🎓 ${escHtml(a.grado)}`:''}${a.grupo?' · 🧑‍🤝‍🧑 grupo':''}</small></div>${badge(st)}</div>`;
   }).join('')||(session.rol==='docente'
     ? `<div class="empty">No hay actividades en este módulo.<br><br><button class="btn btn-primary btn-sm" onclick="navigate('crear','${cid}')">+ Crear primera actividad en ${courseOf(cid).corto}</button></div>`
     : '<div class="empty">No hay actividades en este módulo.</div>')}</div>`;
@@ -2178,7 +2495,7 @@ function viewActividades(q){
     <div style="display:flex;gap:10px;flex-wrap:wrap">
       <input id="actSearch" placeholder="🔍 Buscar por título…" value="${q||''}" oninput="renderActividades(this.value)" style="flex:1;min-width:200px;border:1px solid var(--border);border-radius:10px;padding:10px 12px">
       <select id="actCourse" onchange="renderActividades(document.getElementById('actSearch').value)" style="border:1px solid var(--border);border-radius:10px;padding:10px"><option value="">Todos</option>${Object.values(COURSES).map(c=>`<option value="${c.id}">${c.icono} ${c.corto}</option>`).join('')}</select>
-      ${session.rol==='docente'?`<button class="btn btn-primary btn-sm" onclick="navigate('crear')">+ Crear actividad</button>`:''}
+      ${session.rol==='docente'?`<select id="actGrado" onchange="renderActividades(document.getElementById('actSearch').value)" aria-label="Filtrar por grado" style="border:1px solid var(--border);border-radius:10px;padding:10px"><option value="">Todos los grados</option><option value="4.°">4.°</option><option value="5.°">5.°</option></select><button class="btn btn-primary btn-sm" onclick="navigate('crear')">+ Crear actividad</button>`:''}
     </div>
     <div id="actList" style="margin-top:12px"></div>
   </div>`;
@@ -2186,15 +2503,23 @@ function viewActividades(q){
 function renderActividades(q){
   const box=document.getElementById('actList'); if(!box) return;
   const cf=document.getElementById('actCourse')?.value||'';
-  const list=visibleActivities().filter(a=>(!cf||a.curso===cf)&&a.titulo.toLowerCase().includes((q||'').toLowerCase()));
+  const gf=session.rol==='docente'?(document.getElementById('actGrado')?.value||''):'';
+  // Docente: filtro por grado independiente (4.°/5.°). Estudiante: ya se
+  // filtra automáticamente por su grado+módulo en visibleActivities().
+  const list=visibleActivities().filter(a=>
+    (!cf||a.curso===cf) &&
+    (!gf||gradoDigito(a.grado)===gradoDigito(gf)) &&
+    a.titulo.toLowerCase().includes((q||'').toLowerCase()));
   box.innerHTML=list.map(a=>{
     const sub=session.rol==='estudiante'?mySubmission(a.id):null;
     const st=session.rol==='estudiante'?statusForStudent(a,sub):(a.estado==='borrador'?{key:'borrador',label:'Borrador'}:{key:'publicada',label:'Publicada'});
     return `<div class="activity-item"><div class="act-ico" style="background:#ede9fe">${courseOf(a.curso).icono}</div>
-    <div class="act-info"><b>${escHtml(a.titulo)}</b><small>${courseOf(a.curso).nombre} · ⏰ ${fmtFecha(a.limite)} ${fmtHora12(a.hora)}</small></div>${badge(st)}
+    <div class="act-info"><b>${escHtml(a.titulo)}</b><small>${courseOf(a.curso).nombre} · ⏰ ${fmtFecha(a.limite)} ${fmtHora12(a.hora)}${a.grado?` · 🎓 ${escHtml(a.grado)}`:''}${a.grupo?' · 🧑‍🤝‍🧑 grupo':''}</small></div>${badge(st)}
     <button class="btn btn-ghost btn-sm" onclick="navigate('actividad','${a.id}')">Ver</button>
     ${session.rol==='docente'?`<button class="btn btn-outline btn-sm" onclick="navigate('editar','${a.id}')">✏️</button><button class="btn btn-danger btn-sm" onclick="delActivity('${a.id}')">🗑</button>`:''}</div>`;
-  }).join('')||'<div class="empty">Sin actividades todavía.<br><small>Crea la primera con “+ Crear actividad” y elígela en su módulo correspondiente.</small></div>';
+  }).join('') || (gf
+    ? `<div class="empty">Sin actividades del <b>${escHtml(gf)}</b> grado con estos filtros.<br><small>Elige otro grado o cambia el módulo.</small></div>`
+    : '<div class="empty">Sin actividades todavía.<br><small>Crea la primera con “+ Crear actividad” y elígela en su módulo correspondiente.</small></div>');
 }
 
 /* ---------- 8. Crear / Editar (siempre en su módulo correspondiente) ---------- */
@@ -2207,7 +2532,7 @@ function viewCrear(editId, presetCurso){
     if(!COURSES[a.curso]) a = {...a, curso: (presetCurso && COURSES[presetCurso]) ? presetCurso : 'moviles'};
   } else {
     const initialCurso = (presetCurso && COURSES[presetCurso]) ? presetCurso : 'moviles';
-    a = {curso:initialCurso,titulo:'',descripcion:'',instrucciones:'',material:'',publicacion:new Date().toISOString().slice(0,10),limite:'2026-10-15',hora:'23:59',tipos:'.pdf,.docx,.pptx',multiple:true,estado:'publicada',permitirTarde:false};
+    a = {curso:initialCurso,titulo:'',descripcion:'',instrucciones:'',material:'',publicacion:new Date().toISOString().slice(0,10),limite:'2026-10-15',hora:'23:59',tipos:'.pdf,.docx,.pptx',multiple:true,estado:'publicada',permitirTarde:false,grado:gradoDeModulo(initialCurso)||'4.°'};
   }
   pendingFiles=[]; pendingFileHandles=[];
   const destCurso = courseOf(a.curso);
@@ -2222,8 +2547,9 @@ function viewCrear(editId, presetCurso){
   <div class="grid2">
   <div class="card">
     <div class="form-grid">
-      <div class="field"><label>Módulo</label><select id="f_curso" oninput="updPreview()">${courseOptions(a.curso)}</select></div>
+      <div class="field"><label>Módulo</label><select id="f_curso" oninput="syncGradoDeModulo();updPreview()">${courseOptions(a.curso)}</select></div>
       <div class="field"><label>Estado</label><select id="f_estado" oninput="updPreview()"><option value="publicada" ${a.estado==='publicada'?'selected':''}>🟢 Publicada</option><option value="borrador" ${a.estado==='borrador'?'selected':''}>📝 Borrador</option></select></div>
+      ${document.getElementById('f_grupo')?.checked?'<div class="field full"><div class="alert alert-blue" style="margin:0">🧑‍🤝‍🧑 En grupo: un integrante envía y la nota se replica a todos.</div></div>':''}
       <div class="field full"><label>Título de la actividad</label><input id="f_titulo" value="${escHtml(a.titulo)}" placeholder="Ej. PowerPoint: Mi proyecto de vida" oninput="updPreview()"></div>
       <div class="field full"><label>Descripción</label><textarea id="f_desc" oninput="updPreview()">${escHtml(a.descripcion)}</textarea></div>
       <div class="field full"><label>Instrucciones para el estudiante</label><textarea id="f_inst" oninput="updPreview()">${escHtml(a.instrucciones)}</textarea></div>
@@ -2232,7 +2558,8 @@ function viewCrear(editId, presetCurso){
       <div class="field"><label>Fecha de publicación</label><input type="date" id="f_pub" value="${a.publicacion}"></div>
       <div class="field"><label>Fecha límite</label><input type="date" id="f_lim" value="${a.limite}" oninput="updPreview()"></div>
       <div class="field"><label>Hora límite</label><input type="time" id="f_hora" value="${a.hora}" oninput="updPreview()"></div>
-      <div class="field"><label>Opciones</label><div style="font-size:13.5px"><label><input type="checkbox" id="f_mult" ${a.multiple?'checked':''}> Permitir varios archivos</label><br><label><input type="checkbox" id="f_tarde" ${a.permitirTarde?'checked':''}> Aceptar entregas tardías</label></div></div>
+      <div class="field"><label>Grado asignado (filtro automático)</label><select id="f_grado" oninput="updPreview()"><option value="" ${a.grado?'':'selected'}>Todos los grados (sin filtro)</option>${GRADOS_OPT.map(gr=>`<option value="${gr}" ${a.grado===gr?'selected':''}>${gr}</option>`).join('')}</select></div>
+      <div class="field"><label>Opciones</label><div style="font-size:13.5px"><label><input type="checkbox" id="f_mult" ${a.multiple?'checked':''}> Permitir varios archivos</label><br><label><input type="checkbox" id="f_tarde" ${a.permitirTarde?'checked':''}> Aceptar entregas tardías</label><br><label><input type="checkbox" id="f_grupo" ${a.grupo?'checked':''} oninput="updPreview()"> 🧑‍🤝‍🧑 Trabajo en grupo (un integrante envía por todos y la nota se replica)</label></div></div>
     </div>
     <div style="display:flex;gap:10px;margin-top:14px;flex-wrap:wrap">
       <button class="btn btn-outline" onclick="saveActivity('${editId||''}','borrador')">💾 Guardar borrador</button>
@@ -2245,7 +2572,16 @@ function viewCrear(editId, presetCurso){
 function updPreview(){
   const g=id=>document.getElementById(id)?.value||'';
   const box=document.getElementById('previewBox'); if(!box) return;
-  box.innerHTML=`<b>${escHtml(g('f_titulo'))||'Título de la actividad'}</b><br><small>Módulo: ${courseOf(g('f_curso')).nombre}</small><p style="font-size:13px">${escHtml((g('f_desc')||'Descripción…').slice(0,160))}</p><div class="alert alert-blue" style="margin:0">⏰ Límite: ${escHtml(g('f_lim'))} · ${escHtml(g('f_hora'))} · Tipos: ${escHtml(g('f_tipos'))}</div>`;
+  box.innerHTML=`<b>${escHtml(g('f_titulo'))||'Título de la actividad'}</b><br><small>Módulo: ${courseOf(g('f_curso')).nombre}${g('f_grado')?` · 🎓 ${escHtml(g('f_grado'))}`:' · Todos los grados'}</small><p style="font-size:13px">${escHtml((g('f_desc')||'Descripción…').slice(0,160))}</p><div class="alert alert-blue" style="margin:0">⏰ Límite: ${escHtml(g('f_lim'))} · ${escHtml(g('f_hora'))} · Tipos: ${escHtml(g('f_tipos'))}</div>`;
+}
+/* Al cambiar el módulo en el formulario, el grado sugerido sigue la
+   política del colegio: Móviles -> 4.º · Ensamblaje -> 5.º */
+function syncGradoDeModulo(){
+  const cid=document.getElementById('f_curso')?.value;
+  const target=gradoDeModulo(cid);
+  if(!target) return;
+  const sel=document.getElementById('f_grado');
+  if(sel) sel.value=target;
 }
 async function saveActivity(editId,estado){
   const g=id=>document.getElementById(id).value;
@@ -2265,7 +2601,7 @@ async function saveActivity(editId,estado){
     toast('⚠️ Módulo no válido: se asignó a "'+courseOf(cursoSel).corto+'".');
   }
   const d=store();
-  const obj={curso:cursoSel,titulo,descripcion:g('f_desc'),instrucciones:g('f_inst'),tipos:g('f_tipos')||'.pdf',publicacion:g('f_pub')||new Date().toISOString().slice(0,10),limite:g('f_lim'),hora:g('f_hora')||'23:59',multiple:document.getElementById('f_mult').checked,permitirTarde:document.getElementById('f_tarde').checked,estado,creadoPor:session?.email||'',creadoEn:new Date().toISOString()};
+  const obj={curso:cursoSel,titulo,descripcion:g('f_desc'),instrucciones:g('f_inst'),tipos:g('f_tipos')||'.pdf',publicacion:g('f_pub')||new Date().toISOString().slice(0,10),limite:g('f_lim'),hora:g('f_hora')||'23:59',grado:g('f_grado')||'',gradoAuto:false,multiple:document.getElementById('f_mult').checked,permitirTarde:document.getElementById('f_tarde').checked,grupo:!!document.getElementById('f_grupo')?.checked,estado,creadoPor:session?.email||'',creadoEn:new Date().toISOString()};
   const f=document.getElementById('f_mat').files[0];
   const finalId = editId || ('a'+Date.now());
   obj.id = finalId;
@@ -2385,27 +2721,41 @@ function viewActividadDocente(id){
   return `<button class="btn btn-outline btn-sm" onclick="navigate('actividades')">← Actividades</button>
   <div class="card" style="margin-top:12px"><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><h2 style="margin:0;flex:1">${escHtml(a.titulo)}</h2>${badge(a.estado==='borrador'?{key:'borrador',label:'Borrador'}:{key:'publicada',label:'Publicada'})}</div>
   <p style="color:#64748b">${courseOf(a.curso).icono} ${courseOf(a.curso).nombre}</p><p>${escHtml(a.descripcion)}</p>
-  <dl class="kv"><dt>📅 Publicación</dt><dd>${fmtFecha(a.publicacion)}</dd><dt>⏰ Límite</dt><dd>${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</dd><dt>📎 Material</dt><dd>${a.material?`<a href="#" onclick="downloadMaterial('${a.id}');return false">📥 ${escHtml(a.material)}</a>`:'—'}</dd><dt>📥 Trabajos</dt><dd>${subs.length} / ${getAllStudents().length}</dd></dl>
-  <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="navigate('editar','${a.id}')">✏️ Editar</button><button class="btn btn-ghost btn-sm" onclick="navigate('entregas')">📤 Ver trabajos</button><button class="btn btn-danger btn-sm" onclick="delActivity('${a.id}')">Eliminar</button></div></div>`;
+  <dl class="kv"><dt>📅 Publicación</dt><dd>${fmtFecha(a.publicacion)}</dd><dt>⏰ Límite</dt><dd>${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</dd><dt>📎 Material</dt><dd>${a.material?`<a href="#" onclick="downloadMaterial('${a.id}');return false">📥 ${escHtml(a.material)}</a>`:'—'}</dd><dt>🎓 Grado asignado</dt><dd>${a.grado?`<b>${escHtml(a.grado)}</b> (solo visible para estudiantes de ese grado)`:'Todos los grados (sin filtro)'}</dd><dt>📥 Trabajos</dt><dd>${new Set(subs.map(x=>x.email)).size} / ${((a.grado)?getAllStudents().filter(st=>!st.grado||gradoDigito(st.grado)===gradoDigito(a.grado)).length:getAllStudents().length)}${a.grupo?' · 🧑‍🤝‍🧑 En grupo':''}</dd></dl>
+  <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="navigate('editar','${a.id}')">✏️ Editar</button><button class="btn btn-ghost btn-sm" onclick="verTrabajosDeActividad('${a.id}')">📤 Ver trabajos</button><button class="btn btn-danger btn-sm" onclick="delActivity('${a.id}')">Eliminar</button></div></div>`;
 }
 
 /* 8-12. Vista estudiante + subir + confirmación */
 function viewActividadEst(id){
   const a=store().activities.find(x=>x.id===id); if(!a) return '<div class="card">No existe</div>';
   if(!canAccessModule(a.curso)) return viewBloqueado(a.curso);
+  if(!gradeOkForStudent(a)) return `<div class="card"><h2>🔒 Actividad de otro grado</h2><p>Esta actividad está asignada al <b>${escHtml(a.grado)}</b> grado; tu ficha es ${escHtml(formatGradoSeccion(session)||'sin grado definido')}.</p><button class="btn btn-outline btn-sm" onclick="navigate('cursos')">← Volver a módulos</button></div>`;
   const sub=mySubmission(id);
   const st=statusForStudent(a,sub);
   const diff=deadlineOf(a)-new Date();
   const dias=Math.ceil(diff/(24*3600*1000));
   const vencida=diff<0 && !a.permitirTarde;
-  let countHtml = sub ? `<div class="alert alert-green">✓ Presentado ${sub.late?'fuera de plazo':'a tiempo'} · ${fmtFechaHora(sub.fecha)}</div>`
-    : vencida ? `<div class="alert alert-red">⚠️ Actividad vencida — ya no se aceptan trabajos.</div>`
+  // Modo grupo: si ya soy miembro de un grupo (copia del líder), no puedo reenviar
+  const esMiembroGrupo = !!(sub && sub.grupo && !sub.grupoLider);
+  const liderGrupo = esMiembroGrupo ? (store().submissions.find(x=>x.activityId===id && x.grupoLider && ((x.integrantes||[]).includes(sub.email)))?.estudiante || sub.grupoNombre || 'un integrante') : '';
+  const isGroupMode = a.grupo && !esMiembroGrupo && (!sub || sub.grupoLider || !sub.grupo);
+  const classmates = a.grupo ? getAllStudents().filter(stu=>{
+    if(stu.email===session.email) return false;
+    if(session.grado && session.seccion){
+      if(stu.grado && stu.seccion) return stu.grado===session.grado && stu.seccion===session.seccion;
+    }
+    return true;
+  }) : [];
+  let countHtml = sub && sub.manual ? `<div class="alert alert-yellow">📝 El docente registró una calificación <b>sin entrega</b> para esta actividad.</div>`
+    : sub ? `<div class="alert alert-green">✓ Presentado ${sub.late?'fuera de plazo':'a tiempo'} · ${fmtFechaHora(sub.fecha)}</div>`
+    : vencida ? `<div class="countdown" style="background:linear-gradient(135deg,#fee2e2,#fecaca);border-color:#fca5a5"><b style="font-size:20px;color:#dc2626">⚠️ Actividad vencida</b><br><small>Ya no se aceptan trabajos<br>Límite: ${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</small></div>`
+    : diff<0 ? `<div class="countdown"><b style="font-size:20px;color:#dc2626">⚠️ Actividad vencida</b><br><small>Se aceptan entregas tarde<br>Límite: ${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</small></div>`
     : `<div class="countdown">📅 <b>Faltan ${dias} día(s) para presentar</b><br><small>Límite: ${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</small></div>`;
   return `
   <button class="btn btn-outline btn-sm" onclick="navigate('curso','${a.curso}')">← ${courseOf(a.curso).nombre}</button>
   <div class="card" style="margin-top:12px">
     <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><h2 style="margin:0;flex:1">${escHtml(a.titulo)}</h2>${badge(st)}</div>
-    <p style="color:#64748b"><b>Módulo:</b> ${courseOf(a.curso).nombre}</p>
+    <p style="color:#64748b"><b>Módulo:</b> ${courseOf(a.curso).nombre}${a.grado?` · <b>Grado:</b> 🎓 ${escHtml(a.grado)}`:''}</p>
     <h3>Descripción</h3><p>${escHtml(a.descripcion)||'—'}</p>
     <h3>Instrucciones</h3><p style="white-space:pre-line;background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:12px">${escHtml(a.instrucciones)||'—'}</p>
 <dl class="kv"><dt>📎 Material de apoyo</dt><dd>${a.material?`<a href="#" onclick="downloadMaterial('${a.id}');return false">📥 ${escHtml(a.material)}</a>`:'Sin material adjunto'}</dd>
@@ -2415,19 +2765,32 @@ function viewActividadEst(id){
   </div>
   <div class="card">
     <h3>📤 Sube tu trabajo</h3>
-    ${sub?`<div class="alert alert-green">✓ Trabajo presentado correctamente<br><small>📅 ${fmtFechaHora(sub.fecha)} · 📄 ${escHtml(sub.archivo)} (${escHtml(sub.tam)}) · Estado: ${sub.late?'Fuera de plazo':'Presentado'}</small></div>
-      ${gradeOf(sub)!=null?`<div class="alert alert-blue">⭐ Tu nota: <b>${gradeOf(sub)}/20</b>${sub.feedback?` — 💬 ${escHtml(sub.feedback)}`:''}</div>`:`<div class="alert alert-blue">⏳ Tu trabajo está en revisión. Tu nota aparecerá aquí cuando el docente califique.</div>`}
+    ${sub && sub.manual ? `<div class="alert alert-blue">⭐ Calificación registrada sin entrega: <b>${gradeOf(sub)}/20</b>${sub.feedback?` — 💬 ${escHtml(sub.feedback)}`:''}</div>`
+    : esMiembroGrupo ? `<div class="alert alert-green">🧑‍🤝‍🧑 Trabajo presentado <b>por tu grupo</b> (enviado por ${escHtml(liderGrupo)})<br><small>📅 ${fmtFechaHora(sub.fecha)} · 📄 ${escHtml(sub.archivo)} (${escHtml(sub.tam)}) · Estado: ${sub.late?'Fuera de plazo':'Presentado'}</small></div>
+      ${gradeOf(sub)!=null?`<div class="alert alert-blue">⭐ Nota del grupo: <b>${gradeOf(sub)}/20</b>${sub.feedback?` — 💬 ${escHtml(sub.feedback)}`:''}</div>`:`<div class="alert alert-blue">⏳ En revisión. El docente calificará a todo el grupo.</div>`}`
+    : sub?`<div class="alert alert-green">✓ Trabajo presentado correctamente${sub.grupo?` · 👥 Grupo: <b>${escHtml(sub.grupoNombre||'grupo')}</b>${(sub.integrantes||[]).length?` (${sub.integrantes.length} integrantes)`:''}`:''}<br><small>📅 ${fmtFechaHora(sub.fecha)} · 📄 ${escHtml(sub.archivo)} (${escHtml(sub.tam)}) · Estado: ${sub.late?'Fuera de plazo':'Presentado'}</small></div>
+      ${gradeOf(sub)!=null?`<div class="alert alert-blue">⭐ Tu nota${sub.grupo?' (nota del grupo, replicada a todos los integrantes)':''}: <b>${gradeOf(sub)}/20</b>${sub.feedback?` — 💬 ${escHtml(sub.feedback)}`:''}</div>`:`<div class="alert alert-blue">⏳ Tu trabajo está en revisión. Tu nota aparecerá aquí cuando el docente califique${sub.grupo?' (también a tus compañeros)':''}.</div>`}
       ${!vencida?`<p style="font-size:13.5px;color:#64748b">Puedes reemplazar tu archivo antes de la fecha límite.</p>`:''}`
     :''}
-    ${(!sub||!vencida)?`
-    <div class="dropzone" id="dz" onclick="document.getElementById('fileIn').click()" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="this.classList.remove('over')" ondrop="dropFiles(event)">
+    ${esMiembroGrupo?'':(!vencida ? `
+    ${a.grupo&&isGroupMode?`
+    <div class="alert alert-blue">🧑‍🤝‍🧑 Actividad <b>en grupo</b>: un solo integrante envía el archivo y el docente califica a todo el grupo.</div>
+    <div class="form-grid">
+      <div class="field"><label>👥 Nombre del grupo</label><input id="gName" placeholder="Ej. Los Innovadores"></div>
+      <div class="field"><label>👥 Correos extra (opcional, separados por coma)</label><input id="gExtra" placeholder="correo personal del compañero, otro@correo.com"></div>
+    </div>
+    <div class="field"><label>👥 Integrantes (además de ti)</label>
+      <div id="groupMembers" style="font-size:13.5px;max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:10px">
+        ${classmates.map(c=>`<label style="display:block;cursor:pointer"><input type="checkbox" style="accent-color:var(--primary)" value="${escHtml(c.email)}"> ${escHtml(c.nombre)}${c.grado||c.seccion?` <small style="color:#64748b">(${escHtml([c.grado,c.seccion].filter(Boolean).join(' · '))})</small>`:''}</label>`).join('')||'<small style="color:#64748b">No hay compañeros registrados en tu clase todavía. Puedes escribir sus correos arriba.</small>'}
+      </div>
+    </div>`:''}
+    <div class="dropzone" id="dz" onclick="document.getElementById('fileIn').click()" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="event.preventDefault();this.classList.remove('over')" ondrop="dropFiles(event)">
       📁 Arrastra y suelta tus archivos aquí<br><small>o haz clic para seleccionar · Permitidos: ${a.tipos} · Máx. 10 MB por archivo</small>
       <input type="file" id="fileIn" ${a.multiple?'multiple':''} style="display:none" onchange="pickFiles(this)">
     </div>
     <div id="fileList"></div>
-    <button class="btn btn-success" style="margin-top:12px;${vencida&&!sub?'opacity:.5;pointer-events:none':''}" onclick="submitWork('${a.id}')">${sub?'🔄 Reemplazar y enviar de nuevo':'📨 Enviar trabajo'}</button>
-    ${vencida&&!sub?'<p style="color:#dc2626;font-size:13px">⚠️ Actividad vencida. No se permite el envío salvo autorización del docente.</p>':''}
-    `:''}
+    <button class="btn btn-success" style="margin-top:12px" onclick="submitWork('${a.id}')">${sub?'🔄 Reemplazar y enviar de nuevo':'📨 Enviar trabajo'}</button>
+    `:`<div class="alert alert-red">🔒 El periodo de entrega terminó. Ya no puedes subir archivos para esta actividad.</div>`)}
   </div>`;
 }
 async function pickFiles(inp){
@@ -2451,13 +2814,41 @@ async function submitWork(activityId){
   if(!pendingFiles.length){toast('⚠️ Selecciona al menos un archivo');return;}
   const d=store(); const a=d.activities.find(x=>x.id===activityId);
   if(!a){toast('⚠️ Actividad no encontrada');return;}
-  if(session.rol === 'estudiante' && !canAccessModule(a.curso)){ toastLocked(a.curso); navigate('cursos'); return; }
+  if(session.rol === 'estudiante'){
+    if(!canAccessModule(a.curso)){ toastLocked(a.curso); navigate('cursos'); return; }
+    if(!gradeOkForStudent(a)){ toast('🔒 Esta actividad es del '+a.grado+' grado'); navigate('cursos'); return; }
+  }
   const now=new Date(); const late=now>deadlineOf(a);
   if(late && !a.permitirTarde){toast('⚠️ Actividad vencida');render();return;}
   if(!supa){ toast('⚠️ Supabase no configurado: pega tu URL y anon key en app.js'); return; }
   toast('☁️ Subiendo a Supabase…');
-  const prev = d.submissions.find(s=>s.activityId===activityId&&s.email===session.email);
-  d.submissions=d.submissions.filter(s=>!(s.activityId===activityId&&s.email===session.email));
+  // Datos de grupo (actividades grupales): un integrante envía por todos
+  let grupoData = null;
+  if(a.grupo){
+    const gName = (document.getElementById('gName')?.value || '').trim();
+    const emails = new Set([ (session.email||'').toLowerCase() ]);
+    try {
+      document.querySelectorAll('#groupMembers input[type=checkbox]:checked').forEach(c=>{
+        const v=(c.value||'').trim().toLowerCase(); if(v) emails.add(v);
+      });
+    } catch(e){}
+    (document.getElementById('gExtra')?.value||'').split(/[,;\s]+/).forEach(x=>{
+      const v=x.trim().toLowerCase(); if(v && v.includes('@')) emails.add(v);
+    });
+    if(emails.size>1) grupoData = { grupoNombre:gName||('Grupo de '+firstName()), integrantes:[...emails] };
+  }
+  const meKey=(session.email||'').toLowerCase();
+  // Todas las entregas anteriores de ESTE estudiante en ESTA actividad
+  // (comparación de correo insensible a mayúsculas). Serán reemplazadas:
+  // se eliminan del caché local Y de la nube para que no queden duplicados.
+  const prevList = d.submissions.filter(s =>
+    s.activityId===activityId &&
+    ((s.email||'').toLowerCase()===meKey ||
+      (a.grupo && s.grupo && !s.grupoLider && ((s.integrantes||[]).includes(meKey)))));
+  d.submissions=d.submissions.filter(s=>!prevList.includes(s));
+  // Última entrega previa (la más reciente por fecha) para conservar nota/comentario
+  // si el docente ya la había calificado y no debe perderse al resubir.
+  const prev = prevList.slice().sort((x,y)=>((y.fecha||'').localeCompare(x.fecha||'')))[0] || null;
   const nuevos = [];
   for(let i=0;i<pendingFiles.length;i++){
     const f = pendingFiles[i];
@@ -2471,12 +2862,39 @@ async function submitWork(activityId){
         fileUrl = up.url; storagePath = up.path;
       }catch(err){ console.warn('Supabase falló:', err); toast('⚠️ No se pudo subir "'+f.name+'". Revisa tu conexión y configuración.'); continue; }
     }
-    nuevos.push({id:'s'+Date.now()+i+'_'+Math.floor(Math.random()*1e4),activityId,estudiante:session.nombre,email:session.email,fecha:now.toISOString(),archivo:f.name,tam:f.size,late,mime:f.mime||mimeForExt(f.name),dataUrl:'',fileUrl,storagePath,grade:(prev && prev.archivo===f.name && prev.grade!=null)?prev.grade:null,feedback:(prev && prev.archivo===f.name)?(prev.feedback||''):'',gradedAt:(prev && prev.archivo===f.name)?(prev.gradedAt||null):null,gradedBy:(prev && prev.archivo===f.name)?(prev.gradedBy||'') :''});
+    nuevos.push({id:'s'+Date.now()+i+'_'+Math.floor(Math.random()*1e4),activityId,estudiante:session.nombre,email:session.email,fecha:now.toISOString(),archivo:f.name,tam:f.size,late,mime:f.mime||mimeForExt(f.name),dataUrl:'',fileUrl,storagePath,grade:(prev && prev.grade!=null && (prev.manual || prev.archivo===f.name))?prev.grade:null,feedback:(prev && (prev.manual || prev.archivo===f.name))?(prev.feedback||''):'',gradedAt:(prev && (prev.manual || prev.archivo===f.name))?(prev.gradedAt||null):null,gradedBy:(prev && (prev.manual || prev.archivo===f.name))?(prev.gradedBy||'') :''});
+    if(grupoData){ nuevos[nuevos.length-1].grupo=true; nuevos[nuevos.length-1].grupoNombre=grupoData.grupoNombre; nuevos[nuevos.length-1].integrantes=grupoData.integrantes; nuevos[nuevos.length-1].grupoLider=true; }
   }
-  if(!nuevos.length){ return; }
+  // Copias para cada integrante del grupo (mismo archivo, sin nota aún)
+  let memberCopies = [];
+  if(grupoData && nuevos.length){
+    const me=(session.email||'').toLowerCase();
+    grupoData.integrantes.filter(m=>m!==me).forEach(m=>{
+      const st=getAllStudents().find(x=>(x.email||'').toLowerCase()===m);
+      nuevos.forEach(n=>{
+        memberCopies.push(Object.assign({}, n, {
+          id:'g'+Date.now()+Math.floor(Math.random()*1e4),
+          estudiante: st?st.nombre:(m.split('@')[0]||m),
+          email: m,
+          grupoLider: false,
+          grade: null, feedback: '', gradedAt: null, gradedBy: ''
+        }));
+      });
+    });
+  }
+  if(!nuevos.length){
+    // Nada se subió: restaura la entrega anterior para no perderla.
+    d.submissions = d.submissions.concat(prevList);
+    return;
+  }
+  const todosRegistros = nuevos.concat(memberCopies);
+  // La nube manda limpiar los registros reemplazados (sin duplicados)
+  if(db && prevList.length){
+    try { await Promise.all(prevList.filter(p=>p.id).map(p=>cloudDelete('submissions', p.id))); } catch(e){}
+  }
   // NUBE PRIMERO para entregas: el docente las ve en cualquier dispositivo.
   let cloudOkCount = 0;
-  for(const n of nuevos){
+  for(const n of todosRegistros){
     try {
       d.submissions.push(n);
       const lite = Object.assign({}, n);
@@ -2488,10 +2906,10 @@ async function submitWork(activityId){
   }
   if(db && cloudOkCount === 0) toast('⚠️ Se guardó local pero la nube falló. El docente podría no verlo en otro dispositivo. Revisa tu conexión.');
   try{ saveStore(d); }catch(e){
-    try{ nuevos.forEach(n=>{ n.dataUrl=''; }); const d2=store(); d2.submissions=d2.submissions.filter(s=>!(s.activityId===activityId&&s.email===session.email)); nuevos.forEach(n=>d2.submissions.push(n)); saveStore(d2); }catch(_){ toast('⚠️ No se pudo guardar (almacenamiento lleno)'); return; }
+    try{ todosRegistros.forEach(n=>{ n.dataUrl=''; }); const d2=store(); d2.submissions=d2.submissions.filter(s=>!(s.activityId===activityId && ((s.email||'').toLowerCase()===meKey || (s.grupo && !s.grupoLider && (s.integrantes||[]).includes(meKey))))); todosRegistros.forEach(n=>d2.submissions.push(n)); saveStore(d2); }catch(_){ toast('⚠️ No se pudo guardar (almacenamiento lleno)'); return; }
   }
   pendingFiles=[]; pendingFileHandles=[];
-  toast(db ? '✅ Trabajo enviado y sincronizado con la nube' : '✅ Trabajo guardado local (sin nube)');
+  toast(db ? '✅ Trabajo enviado y sincronizado con la nube' + (grupoData ? ` · 👥 ${escHtml(grupoData.grupoNombre)} (${grupoData.integrantes.length} integrantes)` : '') : '✅ Trabajo guardado local (sin nube)');
   navigate('confirmacion',activityId);
 }
 function viewConfirmacion(activityId){
@@ -2502,7 +2920,7 @@ function viewConfirmacion(activityId){
     <div style="font-size:64px">✅</div><h2>✓ Trabajo presentado correctamente</h2>
     <p style="color:#64748b">${escHtml(a.titulo)} · ${courseOf(a.curso).nombre}</p>
     <div style="display:inline-block;text-align:left;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:16px 22px">
-      📅 Fecha de presentación: <b>${fmtFechaHora(sub.fecha)}</b><br>📄 Archivo: <b>${escHtml(sub.archivo)}</b> (${escHtml(sub.tam)})<br>Estado: <b>${sub.late?'⚠️ Fuera de plazo':'✓ Presentado a tiempo'}</b>
+      📅 Fecha de presentación: <b>${fmtFechaHora(sub.fecha)}</b><br>${sub.grupo?`🧑‍🤝‍🧑 Grupo: <b>${escHtml(sub.grupoNombre||'grupo')}</b> · el docente calificará a todos los integrantes<br>`:''}📄 Archivo: <b>${escHtml(sub.archivo)}</b> (${escHtml(sub.tam)})<br>Estado: <b>${sub.late?'⚠️ Fuera de plazo':'✓ Presentado a tiempo'}</b>
     </div><br><br>
     <button class="btn btn-primary" onclick="navigate('actividad','${a.id}')">Ver actividad</button>
     <button class="btn btn-outline" onclick="navigate('misentregas')">📤 Mis trabajos</button></div>`;
@@ -2511,14 +2929,61 @@ function viewMisEntregas(){
   // Solo trabajos de módulos habilitados (el bloqueado no muestra entregas ni notas)
   const actsById = {};
   store().activities.forEach(a => { actsById[a.id] = a; });
-  const subs=store().submissions.filter(s=>s.email===session.email && actsById[s.activityId] && canAccessModule(actsById[s.activityId].curso));
+  const subs=store().submissions.filter(s=>String(s.email||'').toLowerCase()===(session.email||'').toLowerCase() && actsById[s.activityId] && canAccessModule(actsById[s.activityId].curso));
   const prom = avgProm(subs);
   return `<h1 class="page-title">📤 Mis trabajos</h1><p class="page-sub">Historial de tus trabajos presentados. Promedio: <b>${prom}</b></p>
-  <div class="card"><div class="table-wrap"><table><tr><th>Actividad</th><th>Módulo</th><th>Archivo</th><th>Fecha</th><th>Estado</th><th>Nota</th></tr>
-  ${subs.map(s=>{const a=store().activities.find(x=>x.id===s.activityId);if(!a)return '';const g=gradeOf(s);return `<tr><td><b>${escHtml(a.titulo)}</b>${s.feedback?`<br><small style="color:#475569">💬 ${escHtml(s.feedback)}</small>`:''}</td><td>${courseOf(a.curso).nombre}</td><td>📄 ${escHtml(s.archivo)}<br><button class="btn btn-outline btn-sm" onclick="downloadSubmission('${s.id}')">⬇ Descargar</button></td><td>${fmtFechaHora(s.fecha)}</td><td>${badge(s.late?{key:'tarde',label:'Fuera de plazo'}:{key:'presentado',label:'Presentado'})}</td><td>${gradeBadge(s)}${g!=null&&s.gradedAt?`<br><small style="color:#64748b">${fmtFechaHora(s.gradedAt)}</small>`:''}</td></tr>`;}).join('')||'<tr><td colspan=6 style="text-align:center;color:#64748b">Aún no has presentado trabajos.</td></tr>'}</table></div></div>`;
+  <div class="card"><div class="table-wrap"><table class="responsive-table"><thead><tr><th>Actividad</th><th>Módulo</th><th>Archivo</th><th>Fecha</th><th>Estado</th><th>Nota</th></tr></thead>
+  ${subs.map(s=>{const a=store().activities.find(x=>x.id===s.activityId);if(!a)return '';const g=gradeOf(s);return `<tr><td data-lab="Actividad"><b>${escHtml(a.titulo)}</b>${s.grupo?`<br><small style="color:#64748b">🧑‍🤝‍🧑 Grupo: <b>${escHtml(s.grupoNombre||'grupo')}</b>${s.grupoLider?' · 📤 enviaste por todos':''}</small>`:''}${s.feedback?`<br><small style="color:#475569">💬 ${escHtml(s.feedback)}</small>`:''}</td><td data-lab="Módulo">${courseOf(a.curso).nombre}</td><td data-lab="Archivo">${s.manual?'⚠️ Sin entrega (calificación manual)':'📄 '+escHtml(s.archivo)+'<br><button class="btn btn-outline btn-sm" onclick="downloadSubmission(\''+s.id+'\')">⬇ Descargar</button>'}</td><td data-lab="Fecha">${s.manual?'—':fmtFechaHora(s.fecha)}</td><td data-lab="Estado">${s.manual?badge({key:'entregam',label:'Calificado (sin entrega)'}):badge(s.late?{key:'tarde',label:'Fuera de plazo'}:{key:'presentado',label:'Presentado'})}</td><td data-lab="Nota">${gradeBadge(s)}${g!=null&&s.gradedAt?`<br><small style="color:#64748b">${fmtFechaHora(s.gradedAt)}</small>`:''}</td></tr>`;}).join('')||'<tr><td colspan=6 style="text-align:center;color:#64748b">Aún no has presentado trabajos.</td></tr>'}</table></div></div>`;
 }
 
 /* ---------- 10. Trabajos docente ---------- */
+let entregaGradoFilter='';   // '' = Todos · '4.°' · '5.°'
+let entregaActivitySel='';   // ID de la actividad seleccionada: FILTRO ÚNICO de trabajos
+let entregaPulledFor='';     // actividad cuyo listado ya se consultó en la nube
+function entregaActsFiltradas(){
+  const {activities}=store();
+  return activities.filter(a=>!entregaGradoFilter || gradoDigito(a.grado)===gradoDigito(entregaGradoFilter));
+}
+/* Abre Trabajos filtrado EXCLUSIVAMENTE por una actividad (botón "Ver
+   trabajos" de su ficha y dropdown de la vista). El ID se conserva en
+   estado dedicado + routeParam para que ningún re-render lo pierda. */
+function verTrabajosDeActividad(id){
+  entregaActivitySel=id||'';
+  navigate('entregas', entregaActivitySel);
+}
+/* ID vigente a filtrar: prioriza la actividad expresamente elegida. */
+function entregaCurrentSel(actsF){
+  const pool=store().activities;
+  const pick=[routeParam, entregaActivitySel].find(id=>id && pool.some(x=>x.id===id));
+  return pick || actsF[0].id;
+}
+function setEntregaGrado(v){
+  entregaGradoFilter=v;
+  // Al cambiar de grado selecciona la primera actividad de ese grado
+  routeParam = entregaActsFiltradas()[0]?.id || '';
+  entregaActivitySel = routeParam;   // el filtro pasa a ser esa actividad
+  render();
+}
+/* Backend: consulta Firestore trayendo ÚNICAMENTE los submissions de la
+   actividad seleccionada (where activityId == aid). Espeja en el caché
+   local los documentos que falten y refresca la tabla. */
+async function pullSubmissionsForActivity(aid){
+  if(!db || !aid) return;
+  try{
+    const snap = await db.collection('submissions').where('activityId','==',aid).limit(500).get();
+    if(snap.empty) return;
+    const d = store();
+    let added = 0;
+    snap.forEach(doc=>{
+      if(d.submissions.some(x=>x.id===doc.id)) return;
+      d.submissions.push(Object.assign({}, doc.data()||{}, { id: doc.id }));
+      added++;
+    });
+    if(!added) return;
+    saveStore(d);
+    if(route==='entregas' && entregaActivitySel===aid) renderEntregasRows(aid);
+  }catch(e){ console.warn('pullSubmissionsForActivity:', e); }
+}
 function viewEntregas(){
   const {activities}=store();
   if(!activities.length){
@@ -2535,20 +3000,45 @@ function viewEntregas(){
       </div>
     </div>`;
   }
-  const sel=routeParam||activities.filter(a=>a.estado==='publicada')[0]?.id||activities[0]?.id;
-  if(!routeParam&&sel) routeParam=sel;
-  if(!activities.find(x=>x.id===sel)){
-    routeParam = activities[0].id;
-    return viewEntregas();
+  let actsF = entregaActsFiltradas();
+  // Filtro automático por actividad: si se llegó con una actividad concreta
+  // (botón "Ver trabajos" de su ficha) y el filtro de grado la excluye,
+  // se limpia el filtro para garantizar que muestre SUS trabajos.
+  {
+    const cur=[routeParam, entregaActivitySel].find(id=>id && store().activities.some(x=>x.id===id));
+    if(cur && !actsF.some(x=>x.id===cur)){ entregaGradoFilter=''; actsF = entregaActsFiltradas(); }
   }
+  if(!actsF.length){
+    return `
+    <h1 class="page-title">📤 Trabajos de estudiantes</h1>
+    <div class="card">
+      <div class="field"><label>Grado</label><select onchange="setEntregaGrado(this.value)" aria-label="Filtrar por grado">${[['','Todos los grados'],['4.°','4.° grado'],['5.°','5.° grado']].map(([v,l])=>`<option value="${v}" ${entregaGradoFilter===v?'selected':''}>${l}</option>`).join('')}</select></div>
+      <div class="empty" style="padding:28px;text-align:center">🎓 No hay actividades del <b>${escHtml(entregaGradoFilter||'(este)')}</b> grado.<br><small>Las actividades de 4.º pertenecen al módulo Móviles y las de 5.º a Ensamblaje.</small><br><br><button class="btn btn-outline btn-sm" onclick="setEntregaGrado('')">✕ Ver todos los grados</button></div>
+    </div>`;
+  }
+  const sel = entregaCurrentSel(actsF);
+  routeParam = sel;
+  entregaActivitySel = sel;   // el filtro por ID queda fijado
+  // Backend: trae de Firestore SÓLO los trabajos de esta actividad
+  // (where activityId == sel); si llegan nuevos, refresca la tabla).
+  if(db && entregaPulledFor!==sel){
+    entregaPulledFor=sel;
+    pullSubmissionsForActivity(sel);
+  }
+  const selAct=actsF.find(x=>x.id===sel);
+  const totalSubs=store().submissions.filter(s=>String(s.activityId||'')===String(sel)).length;
   return `
   <h1 class="page-title">📤 Trabajos de estudiantes</h1>
-  <p class="page-sub">Selecciona una actividad y revisa quién presentó.</p>
+  <p class="page-sub">Filtrado por: <b>${escHtml(selAct.titulo)}</b>${selAct.grado?` · ${escHtml(selAct.grado)}`:''} · ${totalSubs} trabajo${totalSubs===1?'':'s'} de ESTA actividad.</p>
   <div class="card">
-    <div class="field"><label>Actividad</label><select onchange="navigate('entregas',this.value)" aria-label="Seleccionar actividad">${activities.map(x=>`<option value="${x.id}" ${x.id===sel?'selected':''}>${courseOf(x.curso).nombre} — ${escHtml(x.titulo)} (⏰ ${fmtFecha(x.limite)})</option>`).join('')}</select></div>
+    <div class="form-grid">
+      <div class="field"><label>Grado</label><select onchange="setEntregaGrado(this.value)" aria-label="Filtrar por grado">${[['','Todos los grados'],['4.°','4.° grado'],['5.°','5.° grado']].map(([v,l])=>`<option value="${v}" ${entregaGradoFilter===v?'selected':''}>${l}</option>`).join('')}</select></div>
+      <div class="field"><label>Actividad (filtro de trabajos)</label><select onchange="verTrabajosDeActividad(this.value)" aria-label="Seleccionar actividad">${actsF.map(x=>`<option value="${x.id}" ${x.id===sel?'selected':''}>${courseOf(x.curso).nombre} — ${escHtml(x.titulo)} ${x.grado?`(🎓 ${x.grado})`:''} (⏰ ${fmtFecha(x.limite)})</option>`).join('')}</select></div>
+    </div>
+    ${(selAct?.grado)?`<div class="alert alert-blue" style="margin:8px 0 0">🎓 Se muestran únicamente actividades, estudiantes y entregas del <b>${escHtml(selAct.grado)}</b> grado.</div>`:''}
     <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
       <div class="filters" style="margin:0">
-        ${[['todos','Todos'],['presentados','Presentados'],['pendientes','Pendientes'],['tarde','Fuera de plazo']].map(([k,l])=>`<button class="${entregaFilter===k?'active':''}" onclick="entregaFilter='${k}';render()">${l}</button>`).join('')}
+        ${[['todos','Todos'],['presentados','Presentados'],['pendientes','Pendientes'],['tarde','Fuera de plazo'],['sinentrega','Sin entrega']].map(([k,l])=>`<button class="${entregaFilter===k?'active':''}" onclick="entregaFilter='${k}';render()">${l}</button>`).join('')}
       </div>
       <input placeholder="🔍 Buscar estudiante…" value="${escHtml(entregaSearch)}" oninput="entregaSearch=this.value;renderEntregasRows('${sel}')" style="margin-left:auto;border:1px solid var(--border);border-radius:999px;padding:8px 14px;min-width:200px" aria-label="Buscar estudiante">
     </div>
@@ -2559,31 +3049,68 @@ function viewEntregas(){
    viewEntregas y renderEntregasRows). Devuelve {a, rows}. */
 function entregaRowsFor(sel){
   const a=store().activities.find(x=>x.id===sel);
-  const all=store().submissions.filter(s=>s.activityId===sel);
+  // FILTRO ESTRICTO: solo registros cuyo activityId coincide con la
+  // actividad seleccionada (comparación por ID como texto). Ningún trabajo
+  // de otra actividad puede entrar aquí.
+  const all=store().submissions.filter(s=>String(s.activityId||'')===String(sel));
+  const subCount=all.filter(s=>!s.manual).length;   // trabajos reales presentados
   const q=(entregaSearch||'').toLowerCase();
-  const rows=getAllStudents().map(st=>{
-    const s=all.find(x=>x.email===st.email);
+  // Filtro por grado de la actividad: solo estudiantes de ese grado
+  // (sin mezclar 4.° y 5.°). Estudiantes sin grado definido se muestran
+  // para que no queden invisibles (ej. fichas a corregir).
+  const baseStudents = (a && a.grado)
+    ? getAllStudents().filter(st=>{
+        const dg=gradoDigito(st.grado);
+        if(!dg) return true;                 // sin grado definido: se muestra (ficha a corregir)
+        return dg===gradoDigito(a.grado);
+      })
+    : getAllStudents();
+  const rows=baseStudents.map(st=>{
+    const mail=(st.email||'').toLowerCase();
+    // Única entrega vigente: el registro MÁS RECIENTE de este estudiante
+    // (comparación de correo insensible a mayúsculas, por coincidir
+    // con lo que ve el estudiante y evitar duplicados históricos).
+    const s=all.filter(x=>String(x.email||'').toLowerCase()===mail)
+      .sort((p,q)=>String(q.fecha||'').localeCompare(String(p.fecha||'')))[0]||null;
     let estado,fecha='—',arch='—';
-    if(s){ estado=s.late?{key:'tarde',label:'Fuera de plazo'}:{key:'presentado',label:'Presentado'}; fecha=fmtFechaHora(s.fecha); arch=s.archivo; }
+    if(s){
+      if(s.manual){ estado={key:'entregam',label:'Calificado (sin entrega)'}; fecha=fmtFechaHora(s.fecha); arch=''; }
+      else { estado=s.late?{key:'tarde',label:'Fuera de plazo'}:{key:'presentado',label:'Presentado'}; fecha=fmtFechaHora(s.fecha); arch=s.archivo; }
+    }
     else { estado=(a&&new Date()>deadlineOf(a))?{key:'vencido',label:'Vencido'}:{key:'pendiente',label:'Pendiente'}; }
     return {st,s,estado,fecha,arch};
   }).filter(r=>{
     if(q && !(r.st.nombre||'').toLowerCase().includes(q) && !(r.st.email||'').toLowerCase().includes(q)) return false;
-    if(entregaFilter==='presentados') return !!r.s&&!r.s.late;
+    if(entregaFilter==='presentados') return !!r.s && !r.s.late && !r.s.manual;
     if(entregaFilter==='pendientes') return !r.s && r.estado.key==='pendiente';
     if(entregaFilter==='tarde') return (!!r.s&&r.s.late)||(!r.s&&r.estado.key==='vencido');
+    if(entregaFilter==='sinentrega') return !r.s || !!r.s.manual;
     return true;
   });
-  return { a, rows };
+  return { a, rows, subCount };
 }
 function renderEntregasRows(sel){
   const box=document.getElementById('entRows');
   if(!box){ render(); return; }
   // re-render de filas sin perder el select
-  const { a, rows } = entregaRowsFor(sel);
+  const { a, rows, subCount } = entregaRowsFor(sel);
   if(!a){ box.innerHTML='<div class="empty">Actividad no encontrada.</div>'; return; }
-  box.innerHTML=`<div class="table-wrap"><table><tr><th>Estudiante</th><th>Estado</th><th>Fecha de presentación</th><th>Archivo</th><th>Nota</th><th>Acción</th></tr>
-  ${rows.map(r=>`<tr><td><b>${escHtml(r.st.nombre)}</b><br><small style="color:#64748b">${escHtml(formatGradoSeccion(r.st))}</small></td><td>${badge(r.estado)}</td><td>${r.fecha}</td><td>${r.arch==='—'?'—':'📄 '+escHtml(r.arch)}</td><td>${r.s?gradeBadge(r.s):'—'}</td><td>${r.s?`<button class="btn btn-outline btn-sm" onclick="downloadSubmission('${r.s.id}')">⬇ Descargar</button> <button class="btn btn-ghost btn-sm" onclick="navigate('entrega-detalle','${r.s.id}')">Ver / Calificar</button>`:'—'}</td></tr>`).join('')||'<tr><td colspan=6 style="text-align:center">Sin estudiantes todavía.<br><small>Aparecerán cuando se registren o presenten trabajos.</small></td></tr>'}</table></div>`;
+  // Sin trabajos reales (solo con calificación manual tampoco cuenta):
+  // mensaje claro de que la actividad no tiene trabajos registrados.
+  const vacioBanner = subCount===0
+    ? `<div class="alert alert-blue" style="margin-bottom:10px">📭 <b>No hay trabajos registrados para esta actividad.</b> Cuando un estudiante presente su trabajo aparecerá aquí. La tabla muestra el aula solo para ver pendientes y calificar sin entrega.</div>`
+    : '';
+  box.innerHTML=`${vacioBanner}<div class="table-wrap"><table class="responsive-table"><thead><tr><th>Estudiante</th><th>Estado</th><th>Fecha de presentación</th><th>Archivo</th><th>Nota</th><th>Acción</th></tr></thead>
+  ${rows.map(r=>{
+    const isManual=r.s&&r.s.manual;
+    const archivo=(r.arch==='—'||r.arch==='')?'—':'📄 '+escHtml(r.arch);
+    const accion=!r.s
+      ?`<button class="btn btn-primary btn-sm" onclick="navigate('entrega-manual','${r.aId||sel}|${escJs(r.st.email)}')">⭐ Calificar sin entrega</button>`
+      :(isManual
+        ?`<button class="btn btn-ghost btn-sm" onclick="navigate('entrega-detalle','${r.s.id}')">Ver / Calificar</button>`
+        :`<button class="btn btn-outline btn-sm" onclick="downloadSubmission('${r.s.id}')">⬇ Descargar</button> <button class="btn btn-ghost btn-sm" onclick="navigate('entrega-detalle','${r.s.id}')">Ver / Calificar</button>`);
+    return `<tr><td data-lab="Estudiante"><b>${escHtml(r.st.nombre)}</b>${r.s&&r.s.grupo?`<br><small style="color:#64748b">🧑‍🤝‍🧑 ${escHtml(r.s.grupoNombre||'grupo')} ${r.s.grupoLider?'· 📤 envió por el grupo':''}</small>`:''}<br><small style="color:#64748b">${escHtml(formatGradoSeccion(r.st))}</small></td><td data-lab="Estado">${badge(r.estado)}</td><td data-lab="Fecha">${r.fecha}</td><td data-lab="Archivo">${archivo}</td><td data-lab="Nota">${r.s?gradeBadge(r.s):'—'}</td><td data-lab="Acción"><div class="act-btns">${accion}</div></td></tr>`;
+  }).join('')||'<tr><td colspan=6 style="text-align:center">Sin estudiantes todavía.<br><small>Aparecerán cuando se registren o presenten trabajos.</small></td></tr>'}</table></div>`;
 }
 
 /* ---------- 14. Detalle trabajo + calificación real ---------- */
@@ -2591,11 +3118,12 @@ function viewEntregaDetalle(sid){
   const s=store().submissions.find(x=>x.id===sid); if(!s) return '<div class="card">No existe el trabajo.</div>';
   const a=store().activities.find(x=>x.id===s.activityId); if(!a) return '<div class="card">La actividad de este trabajo fue eliminada.</div>';
   const g = gradeOf(s);
+  const nombresIntegrantes = (s.integrantes||[]).map(m=>{ const st=getAllStudents().find(x=>(x.email||'').toLowerCase()===(m||'').toLowerCase()); return st?st.nombre:m; });
   return `<button class="btn btn-outline btn-sm" onclick="navigate('entregas','${a.id}')">← Volver a trabajos</button>
   <div class="card" style="margin-top:12px"><h2>📄 Detalle del trabajo</h2>
-  <dl class="kv"><dt>Estudiante</dt><dd><b>${escHtml(s.estudiante)}</b> (${escHtml(s.email)})</dd><dt>Actividad</dt><dd>${escHtml(a.titulo)}</dd><dt>Módulo</dt><dd>${courseOf(a.curso).nombre}</dd><dt>Archivo</dt><dd>📄 ${escHtml(s.archivo)} (${escHtml(s.tam)})</dd><dt>Fecha de presentación</dt><dd>${fmtFechaHora(s.fecha)}</dd><dt>Límite</dt><dd>${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</dd><dt>Estado</dt><dd>${badge(s.late?{key:'tarde',label:'Fuera de plazo'}:{key:'presentado',label:'Presentado a tiempo'})}</dd><dt>Nota actual</dt><dd>${gradeBadge(s)}${g!=null&&s.gradedAt?` <small style="color:#64748b">(${fmtFechaHora(s.gradedAt)})</small>`:''}</dd></dl>
-  <div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="downloadSubmission('${s.id}')">⬇ Descargar archivo</button></div></div>
-  <div class="card"><h3>⭐ Calificar trabajo</h3><p class="desc">La nota se guarda y el estudiante la verá en su cuenta (Mis trabajos, actividad y perfil).</p>
+  <dl class="kv">${s.grupo?`<dt>🧑‍🤝‍🧑 Grupo</dt><dd><b>${escHtml(s.grupoNombre||'Grupo')}</b> · Integrantes: ${escHtml(nombresIntegrantes.join(', '))}${s.grupoLider?' · <b>📤 este integrante envió por todos</b>':''}</dd>`:''}<dt>Estudiante</dt><dd><b>${escHtml(s.estudiante)}</b> (${escHtml(s.email)})</dd><dt>Actividad</dt><dd>${escHtml(a.titulo)}</dd><dt>Módulo</dt><dd>${courseOf(a.curso).nombre}</dd><dt>Archivo</dt><dd>${s.manual?'⚠️ Sin entrega (calificación manual)':'📄 '+escHtml(s.archivo)+' ('+escHtml(s.tam)+')'}</dd><dt>Fecha</dt><dd>${fmtFechaHora(s.fecha)}</dd><dt>Límite</dt><dd>${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</dd><dt>Estado</dt><dd>${s.manual?badge({key:'entregam',label:'Calificado (sin entrega)'}):badge(s.late?{key:'tarde',label:'Fuera de plazo'}:{key:'presentado',label:'Presentado a tiempo'})}</dd><dt>Nota actual</dt><dd>${gradeBadge(s)}${g!=null&&s.gradedAt?` <small style="color:#64748b">(${fmtFechaHora(s.gradedAt)})</small>`:''}</dd></dl>
+  ${s.manual?'':`<div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn btn-primary btn-sm" onclick="downloadSubmission('${s.id}')">⬇ Descargar archivo</button></div>`}</div>
+  <div class="card"><h3>⭐ Calificar trabajo</h3><p class="desc">${s.grupo?'🧑‍🤝‍🧑 <b>Trabajo en grupo:</b> al guardar, la misma nota y comentario se aplicarán automáticamente a todos los integrantes del grupo y cada uno recibirá su notificación.':'La nota se guarda y el estudiante la verá en su cuenta (Mis trabajos, actividad y perfil).'}</p>
     <div class="form-grid">
       <div class="field"><label>Nota (0 – 20)</label><input id="gradeInput" type="number" min="0" max="20" step="0.5" value="${g!=null?g:''}" placeholder="Ej. 17"></div>
       <div class="field"><label>Comentario / retroalimentación</label><input id="gradeFeedback" value="${escHtml(s.feedback)}" placeholder="Ej. Buen trabajo, revisa la portada"></div>
@@ -2611,10 +3139,19 @@ function viewEntregaDetalle(sid){
 let estSearch = '';
 let estGradoFilter = '';
 let estSeccionFilter = '';
+/* Comparación TOLERANTE de grado/sección: los datos guardados pueden venir
+   como "4", "4°", "4.°", "4.º", "4°B"… Se normaliza al dígito (4/5) y a la
+   letra (A/B) para que los filtros funcionen con cualquier formato. */
+function gradoDigito(v){
+  const m = String(v||'').match(/[1-5]/);
+  return m ? m[0] : '';
+}
+function seccionLetra(v){
+  const m = String(v||'').toUpperCase().match(/[A-E]/);
+  return m ? m[0] : '';
+}
 function viewEstudiantes(){
   const allSt = getAllStudents();
-  const grados = [...new Set(allSt.map(s=>s.grado).filter(Boolean))].sort();
-  const secciones = [...new Set(allSt.map(s=>s.seccion).filter(Boolean))].sort();
   let head = `<h1 class="page-title">👥 Gestión de estudiantes</h1>
   <p class="page-sub">${allSt.length} estudiantes · visualiza correo, grado, sección y contraseña temporal · restablece en caso de olvido.</p>
   <div class="alert alert-yellow">🔒 <b>Nota de seguridad:</b> Firebase Auth no permite ver la contraseña real del estudiante. Aquí se muestra la <b>contraseña temporal</b> generada al restablecer. El estudiante recibirá una notificación para <b>conservarla o crear una nueva</b>.</div>`;
@@ -2630,13 +3167,15 @@ function viewEstudiantes(){
   <div class="card">
     <div class="est-toolbar">
       <input id="estSearch" placeholder="🔍 Buscar por nombre o correo…" value="${escHtml(estSearch)}" oninput="estSearch=this.value;renderEstudiantesRows()" aria-label="Buscar estudiante por nombre o correo">
-      <select id="estGrado" onchange="estGradoFilter=this.value;renderEstudiantesRows()">
+      <select id="estGrado" onchange="estGradoFilter=this.value;renderEstudiantesRows()" aria-label="Filtrar por grado">
         <option value="">Todos los grados</option>
-        ${grados.map(g=>`<option value="${g}" ${estGradoFilter===g?'selected':''}>${g}</option>`).join('')}
+        <option value="4.°" ${estGradoFilter==='4.°'?'selected':''}>4.°</option>
+        <option value="5.°" ${estGradoFilter==='5.°'?'selected':''}>5.°</option>
       </select>
-      <select id="estSeccion" onchange="estSeccionFilter=this.value;renderEstudiantesRows()">
+      <select id="estSeccion" onchange="estSeccionFilter=this.value;renderEstudiantesRows()" aria-label="Filtrar por sección">
         <option value="">Todas las secciones</option>
-        ${secciones.map(s=>`<option value="${s}" ${estSeccionFilter===s?'selected':''}>Sección ${s}</option>`).join('')}
+        <option value="A" ${estSeccionFilter==='A'?'selected':''}>Sección A</option>
+        <option value="B" ${estSeccionFilter==='B'?'selected':''}>Sección B</option>
       </select>
       <button class="btn btn-outline btn-sm" onclick="estSearch='';estGradoFilter='';estSeccionFilter='';render()">✕ Limpiar</button>
     </div>
@@ -2656,15 +3195,22 @@ function renderEstudiantesRows(){
   if(!box){ return; }
   const q = (estSearch || '').toLowerCase();
   const rows = allSt.filter(st=>{
-    if(estGradoFilter && st.grado !== estGradoFilter) return false;
-    if(estSeccionFilter && st.seccion !== estSeccionFilter) return false;
-    if(q && !(st.nombre.toLowerCase().includes(q) || st.email.toLowerCase().includes(q))) return false;
+    // Filtros por grado y sección (comparación tolerante de formatos)
+    if(estGradoFilter){
+      const dg = gradoDigito(st.grado), df = gradoDigito(estGradoFilter);
+      if(!dg || dg !== df) return false;
+    }
+    if(estSeccionFilter){
+      const sg = seccionLetra(st.seccion), sf = seccionLetra(estSeccionFilter);
+      if(!sg || sg !== sf) return false;
+    }
+    if(q && !((st.nombre||'').toLowerCase().includes(q) || (st.email||'').toLowerCase().includes(q))) return false;
     return true;
   });
-  if(!rows.length){ box.innerHTML = '<div class="empty">Sin resultados con esos filtros.</div>'; return; }
+  if(!rows.length){ box.innerHTML = `<div class="empty">Sin estudiantes con esos criterios.<br><small>Verifica que tengan <b>grado y sección</b> asignados (✏️ Editar en la fila) o cambia los filtros.</small></div>`; return; }
   const pubCount = store().activities.filter(a=>a.estado==='publicada').length;
-  box.innerHTML = `<div class="table-wrap"><table class="est-table">
-  <tr><th>Estudiante / Correo</th><th>Grado</th><th>Sección</th><th>🔑 Contraseña</th><th>Estado clave</th><th>Rendimiento</th><th>Acción</th></tr>
+  box.innerHTML = `<div class="table-wrap"><table class="est-table responsive-table">
+  <thead><tr><th>Estudiante / Correo</th><th>Grado</th><th>Sección</th><th>🔑 Contraseña</th><th>Estado clave</th><th>Rendimiento</th><th>Acción</th></tr></thead>
   ${rows.map(st=>{
     const subs = store().submissions.filter(s=>s.email.toLowerCase()===st.email.toLowerCase());
     const n = subs.length;
@@ -2683,18 +3229,160 @@ function renderEstudiantesRows(){
       pwdCell = `<small style="color:#64748b">•••••• oculta<br>(Firebase no la expone)</small>`;
     }
     return `<tr>
-      <td><b>${escHtml(st.nombre)}</b><br><small>📧 ${escHtml(st.email)}</small></td>
-      <td><span class="badge b-purple">${escHtml(st.grado) || '—'}</span></td>
-      <td><span class="badge b-blue">${escHtml(st.seccion) || '—'}</span></td>
-      <td>${pwdCell}</td>
-      <td>${resetBadgeFor(st)}${r?`<br><small style="color:#64748b">${r.status==='pendiente'?'Notificado, esperando decisión':('Decidió: '+(r.decision==='nueva'?'crear nueva':'conservar'))}</small>`:''}</td>
-      <td>📥 ${n} · ⭐ ${prom}<br><small style="color:#64748b">${Math.max(pubCount-n,0)} pendientes</small></td>
-      <td><button class="btn btn-primary btn-sm" onclick="resetStudentPassword('${escJs(st.email)}')">🔑 Restablecer</button>
-      ${r&&r.status!=='pendiente'?`<br><small style="color:#64748b">Última: ${fmtFechaHora(r.createdAt)}</small>`:''}</td>
+      <td data-lab="Estudiante"><b>${escHtml(st.nombre)}</b><br><small>📧 ${escHtml(st.email)}</small></td>
+      <td data-lab="Grado"><span class="badge b-purple">${escHtml(st.grado) || '—'}</span></td>
+      <td data-lab="Sección"><span class="badge b-blue">${escHtml(st.seccion) || '—'}</span></td>
+      <td data-lab="Contraseña">${pwdCell}</td>
+      <td data-lab="Estado clave">${resetBadgeFor(st)}${r?`<br><small style="color:#64748b">${r.status==='pendiente'?'Notificado, esperando decisión':('Decidió: '+(r.decision==='nueva'?'crear nueva':'conservar'))}</small>`:''}</td>
+      <td data-lab="Rendimiento">📥 ${n} · ⭐ ${prom}<br><small style="color:#64748b">${Math.max(pubCount-n,0)} pendientes</small></td>
+      <td data-lab="Acción"><div class="act-btns"><button class="btn btn-primary btn-sm" onclick="resetStudentPassword('${escJs(st.email)}')">🔑 Restablecer</button>
+      <button class="btn btn-outline btn-sm" onclick="navigate('estudiante-editar','${escJs(st.email)}')">✏️ Editar</button>
+      <button class="btn btn-danger btn-sm" onclick="navigate('estudiante-eliminar','${escJs(st.email)}')">🗑 Eliminar</button>
+      ${r&&r.status!=='pendiente'?`<br><small style="color:#64748b">Última: ${fmtFechaHora(r.createdAt)}</small>`:''}</div></td>
     </tr>`;
   }).join('')}</table></div>
-  <p class="desc" style="margin-top:10px">Al restablecer se genera una temporal y se envía una notificación al estudiante para que decida si <b>crea una nueva</b> o <b>conserva la temporal</b>.</p>`;
+  <p class="desc" style="margin-top:10px">⚠️ La <b>temporal</b> solo sirve si el estudiante aún puede entrar (la decidirá desde Notificaciones). Si <b>olvidó su contraseña</b>, al pulsar "🔑 Restablecer" llega automáticamente un <b>correo de restablecimiento</b> a su cuenta personal: desde ese enlace crea su contraseña nueva y ya puede ingresar. La temporal NO reemplaza a la de Firebase (no se puede escribir en Auth desde la web).</p>`;
 }
+/* ============================================================
+   GESTIÓN DE ESTUDIANTES — edición y baja por el docente
+   - Editar: nombre, grado y sección. Se actualiza el caché local
+     (`eduaula_users_extra`) y la ficha en Firestore (`users`),
+     además del nombre mostrado en las entregas existentes.
+   - Eliminar: con doble confirmación. Quita la ficha del usuario,
+     sus entregas, calificaciones, avisos y restablecimientos
+     (local + nube). La cuenta de Firebase Auth no puede borrarse
+     desde el cliente (requiere Admin SDK).
+   ============================================================ */
+const GRADOS_OPT = ['1.°','2.°','3.°','4.°','5.°'];
+const SECCIONES_OPT = ['A','B','C','D','E'];
+function viewEstudianteEditar(email){
+  const st = getAllStudents().find(x=>x.email.toLowerCase()===(email||'').toLowerCase());
+  if(!st) return '<div class="card">Estudiante no encontrado.</div>';
+  return `<button class="btn btn-outline btn-sm" onclick="navigate('estudiantes')">← Volver a estudiantes</button>
+  <h1 class="page-title" style="margin-top:10px">✏️ Editar estudiante</h1>
+  <div class="card" style="max-width:560px">
+    <dl class="kv"><dt>Correo</dt><dd>${escHtml(st.email)}</dd></dl>
+    <div class="form-grid">
+      <div class="field full"><label>Nombre completo</label><input id="stNombre" value="${escHtml(st.nombre)}" placeholder="Ej. Ana Quispe"></div>
+      <div class="field"><label>Grado</label><select id="stGrado">${st.grado?'':`<option value="" ${st.grado?'':'selected'}>—</option>`}${GRADOS_OPT.map(gr=>`<option ${st.grado===gr?'selected':''}>${gr}</option>`).join('')}${st.grado&&!GRADOS_OPT.includes(st.grado)?`<option value="" selected>${escHtml(st.grado)} (actual)</option>`:''}</select></div>
+      <div class="field"><label>Sección</label><select id="stSeccion">${st.seccion?'':`<option value="" ${st.seccion?'':'selected'}>—</option>`}${SECCIONES_OPT.map(sc=>`<option ${st.seccion===sc?'selected':''}>${sc}</option>`).join('')}${st.seccion&&!SECCIONES_OPT.includes(st.seccion)?`<option value="" selected>${escHtml(st.seccion)} (actual)</option>`:''}</select></div>
+    </div>
+    <div class="alert alert-blue" style="margin-top:10px">ℹ️ Si cambias el <b>grado o sección</b>, el acceso a los módulos habilitados del estudiante se actualizará.</div>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn btn-success" onclick="saveStudentEdit('${escJs(st.email)}')">💾 Guardar cambios</button>
+      <button class="btn btn-outline" onclick="navigate('estudiantes')">✕ Cancelar</button>
+    </div>
+  </div>`;
+}
+function saveStudentEdit(email){
+  const nombre = (document.getElementById('stNombre')?.value||'').trim();
+  const grado = document.getElementById('stGrado')?.value||'';
+  const seccion = document.getElementById('stSeccion')?.value||'';
+  if(!nombre){ toast('⚠️ Escribe el nombre del estudiante'); return; }
+  const mail = (email||'').toLowerCase();
+  const d = store();
+  const act = d.submissions.filter(s=>(s.email||'').toLowerCase()===mail);
+  // 1) Caché local del roster — crea la ficha SI NO EXISTÍA (antes los
+  //    cambios se perdían y la lista volvía a mostrar "—")
+  upsertExtraUser(mail, { nombre, grado, seccion, rol:'estudiante' });
+  // 2) Refresco INMEDIATO: la lista refleja el cambio sin recargar la página
+  try { if(route==='estudiantes') renderEstudiantesRows(); } catch(e){}
+    // 3) Nombre mostrado en entregas existentes (local + nube)
+  act.forEach(s=>{
+    if(s.estudiante!==nombre){ s.estudiante=nombre; s.actualizadoEn=new Date().toISOString(); cloudSave('submissions', s.id, s); }
+  });
+  saveStore(d);
+  // 4) Ficha real en Firestore `users` (busca por correo + rol estudiante)
+  (async ()=>{
+    try{
+      if(db){
+        const snap = await db.collection('users').where('email','==',mail).get();
+        let w = 0;
+        for(const doc of snap.docs){
+          if((doc.data().rol||'')==='estudiante'){
+            await db.collection('users').doc(doc.id).set({ nombre, grado, seccion }, { merge:true });
+            w++;
+          }
+        }
+        // Reflejar también en el caché lo que quedó en la base de datos
+        try { await pullUsersFromCloud(); } catch(e){}
+      }
+      toast('✅ Estudiante actualizado'+(db?' en la base de datos':'')+(act.length?` · entregas con nombre nuevo: ${act.length}`:''));
+      try { if(route==='estudiantes') renderEstudiantesRows(); } catch(e){}
+    }catch(err){
+      console.warn('Guardar ficha en nube falló:', err);
+      toast('✅ Guardado local. ⚠️ La nube falló: revisa tu conexión.');
+    }
+  })();
+  navigate('estudiantes');
+}
+function viewEstudianteEliminar(email){
+  const st = getAllStudents().find(x=>x.email.toLowerCase()===(email||'').toLowerCase());
+  if(!st) return '<div class="card">Estudiante no encontrado.</div>';
+  const subs = store().submissions.filter(s=>(s.email||'').toLowerCase()===(email||'').toLowerCase());
+  const calif = subs.filter(s=>gradeOf(s)!=null).length;
+  const resets = getPwdResets().filter(r=>(r.studentEmail||'').toLowerCase()===(email||'').toLowerCase()).length;
+  return `<button class="btn btn-outline btn-sm" onclick="navigate('estudiantes')">← Volver a estudiantes</button>
+  <h1 class="page-title" style="margin-top:10px">🗑 Eliminar estudiante</h1>
+  <div class="alert alert-red">⚠️ <b>Acción irreversible.</b> Se eliminará la información del estudiante del sistema.</div>
+  <div class="card" style="max-width:640px">
+    <dl class="kv">
+      <dt>Estudiante</dt><dd><b>${escHtml(st.nombre)}</b> (${escHtml(st.email)})</dd>
+      <dt>Grado y sección</dt><dd>${escHtml(st.grado||'—')} · ${escHtml(st.seccion||'—')}</dd>
+      <dt>Entregas a borrar</dt><dd>${subs.length}</dd>
+      <dt>Calificaciones a borrar</dt><dd>${calif}</dd>
+      <dt>Restablecimientos de clave</dt><dd>${resets}</dd>
+    </dl>
+    <div class="alert alert-yellow" style="margin-top:10px">ℹ️ La cuenta de autenticación (Firebase Auth) del estudiante no puede eliminarse desde la app docente; se elimina su perfil, entregas, calificaciones y notificaciones. Podrá volver a registrar un perfil nuevo si es necesario.</div>
+    <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap">
+      <button class="btn btn-danger" onclick="confirmDeleteStudent('${escJs(st.email)}')">🗑 Eliminar definitivamente</button>
+      <button class="btn btn-outline" onclick="navigate('estudiantes')">✕ Cancelar</button>
+    </div>
+  </div>`;
+}
+async function confirmDeleteStudent(email){
+  const mail=(email||'').toLowerCase();
+  const st=getAllStudents().find(x=>x.email.toLowerCase()===mail);
+  if(!st){ toast('⚠️ Estudiante no encontrado'); return; }
+  if(!confirm(`¿Eliminar definitivamente a ${st.nombre} (${st.email})? Esta acción no se puede deshacer.`)) return;
+  const d=store();
+  // 1) Caché local del roster
+  try{
+    const key='eduaula_users_extra';
+    const arr=JSON.parse(localStorage.getItem(key)||'[]');
+    const rest=arr.filter(u=>(u.email||'').toLowerCase()!==mail);
+    localStorage.setItem(key, JSON.stringify(rest));
+  }catch(e){}
+  // 2) Entregas (local + nube)
+  const subs=d.submissions.filter(s=>(s.email||'').toLowerCase()===mail);
+  d.submissions=d.submissions.filter(s=>(s.email||'').toLowerCase()!==mail);
+  saveStore(d);
+  for(const s of subs){ try{ await cloudDelete('submissions', s.id); }catch(e){} }
+  // 3) Calificaciones y avisos del estudiante (local + nube)
+  try{
+    const garr=getGradeNotifs().filter(n=>(n.studentEmail||'').toLowerCase()!==mail);
+    getGradeNotifs().filter(n=>(n.studentEmail||'').toLowerCase()===mail).forEach(n=>{ try{ cloudDelete('grade_notifications', n.id); }catch(e){} });
+    saveGradeNotifs(garr);
+  }catch(e){}
+  // 4) Restablecimientos de contraseña (local + nube)
+  try{
+    const p=getPwdResets();
+    const del=p.filter(r=>(r.studentEmail||'').toLowerCase()===mail);
+    savePwdResets(p.filter(r=>(r.studentEmail||'').toLowerCase()!==mail));
+    for(const r of del){ try{ cloudDelete('password_resets', r.id); }catch(e){} }
+  }catch(e){}
+  // 5) Ficha del usuario en Firestore (`users`)
+  let cloudOk=true;
+  try{
+    if(db){
+      const snap=await db.collection('users').where('email','==',mail).get();
+      for(const doc of snap.docs){ if((doc.data().rol||'')==='estudiante'){ await db.collection('users').doc(doc.id).delete(); } }
+    }
+  }catch(err){ console.warn('Eliminar ficha en nube falló:', err); cloudOk=false; }
+  toast('🗑 Estudiante eliminado'+(cloudOk?'':' · ⚠️ la ficha en la nube no se pudo borrar'));
+  navigate('estudiantes');
+}
+
 /* ---------- Notificaciones de contraseñas ---------- */
 function viewNotificaciones(){
   if(session.rol === 'docente'){
@@ -2722,31 +3410,31 @@ function viewNotificaciones(){
     <div class="card"><h3>📚 Avisos de actividad enviados</h3>
       <p class="desc">Cada actividad publicada genera un aviso automático a los estudiantes (llega a cualquier dispositivo).</p>
       ${!broadcasts.length?'<div class="empty">Aún no hay avisos. Publica una actividad y aparecerá aquí.</div>':
-      `<div class="table-wrap"><table><tr><th>Actividad</th><th>Módulo</th><th>Límite</th><th>Fecha aviso</th></tr>
-      ${broadcasts.map(n=>`<tr><td><b>${escHtml(n.activityTitle)}</b></td>
-        <td>${escHtml(courseOf(n.module).corto||'')}</td>
-        <td><small>${n.limite?fmtFecha(n.limite)+' '+(n.hora||''):''}</small></td>
-        <td><small>${fmtFechaHora(n.createdAt)}</small></td></tr>`).join('')}</table></div>`}
+      `<div class="table-wrap"><table class="responsive-table"><thead><tr><th>Actividad</th><th>Módulo</th><th>Límite</th><th>Fecha aviso</th></tr></thead>
+      ${broadcasts.map(n=>`<tr><td data-lab="Actividad"><b>${escHtml(n.activityTitle)}</b></td>
+        <td data-lab="Módulo">${escHtml(courseOf(n.module).corto||'')}</td>
+        <td data-lab="Límite"><small>${n.limite?fmtFecha(n.limite)+' '+(n.hora||''):''}</small></td>
+        <td data-lab="Fecha aviso"><small>${fmtFechaHora(n.createdAt)}</small></td></tr>`).join('')}</table></div>`}
     </div>
     <div class="card"><h3>⭐ Calificaciones notificadas a estudiantes</h3>
       <p class="desc">Cada vez que calificas un trabajo se le avisa al estudiante automáticamente.</p>
       ${!grades.length?'<div class="empty">Aún no notificas calificaciones. Califica un trabajo y aparecerá aquí.</div>':
-      `<div class="table-wrap"><table><tr><th>Estudiante</th><th>Actividad</th><th>Nota</th><th>Fecha</th><th>Estado</th></tr>
-      ${grades.map(n=>`<tr><td><b>${escHtml(n.studentName)}</b><br><small>${escHtml(n.studentEmail)}</small></td>
-        <td>${escHtml(n.activityTitle)}<br><small style="color:#64748b">${escHtml(courseOf(n.module).corto||'')}</small></td>
-        <td><b>⭐ ${n.grade}/20</b>${n.feedback?`<br><small>💬 ${escHtml(n.feedback)}</small>`:''}</td>
-        <td><small>${fmtFechaHora(n.createdAt)}</small></td>
-        <td>${n.read?'<span class="badge b-green">✅ Leída</span>':'<span class="badge b-yellow">🟡 Sin leer</span>'}</td></tr>`).join('')}</table></div>`}
+      `<div class="table-wrap"><table class="responsive-table"><thead><tr><th>Estudiante</th><th>Actividad</th><th>Nota</th><th>Fecha</th><th>Estado</th></tr></thead>
+      ${grades.map(n=>`<tr><td data-lab="Estudiante"><b>${escHtml(n.studentName)}</b><br><small>${escHtml(n.studentEmail)}</small></td>
+        <td data-lab="Actividad">${escHtml(n.activityTitle)}<br><small style="color:#64748b">${escHtml(courseOf(n.module).corto||'')}</small></td>
+        <td data-lab="Nota"><b>⭐ ${n.grade}/20</b>${n.feedback?`<br><small>💬 ${escHtml(n.feedback)}</small>`:''}</td>
+        <td data-lab="Fecha"><small>${fmtFechaHora(n.createdAt)}</small></td>
+        <td data-lab="Estado">${n.read?'<span class="badge b-green">✅ Leída</span>':'<span class="badge b-yellow">🟡 Sin leer</span>'}</td></tr>`).join('')}</table></div>`}
     </div>
     <div class="card"><h3>🔑 Restablecimientos de contraseña</h3>
     <p class="desc">${all.length} restablecimientos · ${pend} pendientes de decisión del estudiante.</p>
     ${!all.length?`<div style="text-align:center;padding:20px"><div style="font-size:40px">🔔</div><h3>Sin restablecimientos</h3><p class="desc">Ve a 👥 Estudiantes y pulsa “🔑 Restablecer” cuando un estudiante olvide su contraseña.</p><button class="btn btn-primary btn-sm" onclick="navigate('estudiantes')">Ir a estudiantes</button></div>`:`
-    <div class="table-wrap"><table><tr><th>Estudiante</th><th>Temporal enviada</th><th>Fecha</th><th>Decisión</th><th>Acción</th></tr>
-    ${all.map(r=>`<tr><td><b>${r.studentName}</b><br><small>${r.studentEmail} · ${r.grado||''} ${r.seccion||''}</small></td>
-      <td><code>${r.status==='personalizada'?'•••••• (personalizada)':r.tempPassword}</code></td>
-      <td><small>${fmtFechaHora(r.createdAt)}</small>${r.resolvedAt?`<br><small style="color:#16a34a">Decidió: ${fmtFechaHora(r.resolvedAt)}</small>`:''}</td>
-      <td>${r.status==='pendiente'?'<span class="badge b-yellow">🟡 Esperando al estudiante</span>':(r.status==='conservada'?'<span class="badge b-green">✅ Conservó temporal</span>':'<span class="badge b-blue">🔑 Creó nueva</span>')}</td>
-      <td>${r.status==='pendiente'?'<span style="color:#64748b;font-size:13px">Notificado</span>':`<button class="btn btn-outline btn-sm" onclick="resendReset('${r.id}')">📨 Reenviar</button>`}</td></tr>`).join('')}</table></div>`}</div>`;
+    <div class="table-wrap"><table class="responsive-table"><thead><tr><th>Estudiante</th><th>Temporal enviada</th><th>Fecha</th><th>Decisión</th><th>Acción</th></tr></thead>
+    ${all.map(r=>`<tr><td data-lab="Estudiante"><b>${r.studentName}</b><br><small>${r.studentEmail} · ${r.grado||''} ${r.seccion||''}</small></td>
+      <td data-lab="Temporal"><code>${r.status==='personalizada'?'•••••• (personalizada)':r.tempPassword}</code></td>
+      <td data-lab="Fecha"><small>${fmtFechaHora(r.createdAt)}</small>${r.resolvedAt?`<br><small style="color:#16a34a">Decidió: ${fmtFechaHora(r.resolvedAt)}</small>`:''}</td>
+      <td data-lab="Decisión">${r.status==='pendiente'?'<span class="badge b-yellow">🟡 Esperando al estudiante</span>':(r.status==='conservada'?'<span class="badge b-green">✅ Conservó temporal</span>':'<span class="badge b-blue">🔑 Creó nueva</span>')}</td>
+      <td data-lab="Acción">${r.status==='pendiente'?'<span style="color:#64748b;font-size:13px">Notificado</span>':`<button class="btn btn-outline btn-sm" onclick="resendReset('${r.id}')">📨 Reenviar</button>`}</td></tr>`).join('')}</table></div>`}</div>`;
   }
   // Estudiante
   const mine = getResetsFor(session.email).sort((a,b)=>(b.createdAt||'').localeCompare(a.createdAt||''));
@@ -2839,14 +3527,14 @@ function viewPerfil(){
   const isDoc=session.rol==='docente';
   const actsByIdP = {};
   if(!isDoc) store().activities.forEach(a => { actsByIdP[a.id] = a; });
-  const subs=isDoc?[]:store().submissions.filter(s=>s.email===session.email && actsByIdP[s.activityId] && canAccessModule(actsByIdP[s.activityId].curso));
+  const subs=isDoc?[]:store().submissions.filter(s=>String(s.email||'').toLowerCase()===(session.email||'').toLowerCase() && actsByIdP[s.activityId] && canAccessModule(actsByIdP[s.activityId].curso));
   const prom=!isDoc?avgProm(subs):'';
   return `<h1 class="page-title">👤 ${isDoc?'Mi perfil':'Mi perfil'}</h1><p class="page-sub">Información de tu cuenta.</p>
   <div class="card"><div class="profile-head"><div class="avatar" style="background:${isDoc?'#7c3aed':'#0891b2'}">${session.nombre[0]}</div>
   <div><h2 style="margin:0">${displayName()}</h2><p style="margin:2px 0;color:#64748b">${escHtml(session.email)} · ${isDoc?'Docente':('Estudiante · Grado: '+escHtml(session.grado||'—')+' · Sección: '+escHtml(session.seccion||'—')+(prom!=='—'?' · ⭐ Promedio: '+prom:''))}</p><span class="pill-role">${session.rol.toUpperCase()}${!isDoc&&formatGradoSeccion(session)?' · '+formatGradoSeccion(session):''}</span></div></div>
   <div class="field" style="margin-top:14px"><label>Nombre para mostrar</label><input id="pf_name" value="${escHtml(session.nombre)}"></div>
   <button class="btn btn-primary btn-sm" onclick="session.nombre=document.getElementById('pf_name').value;document.getElementById('miniName').textContent=session.nombre;toast('✅ Perfil actualizado')">Guardar cambios</button></div>
-  ${!isDoc?`<div class="card"><h3>📊 Mi progreso</h3><p class="desc">${subs.length} trabajos presentados · ${subs.filter(s=>gradeOf(s)!=null).length} calificados · ⭐ Promedio: <b>${prom}</b> · Grado ${session.grado||'—'} · Sección ${session.seccion||'—'}.</p>${subs.map(s=>{const a=store().activities.find(x=>x.id===s.activityId);return `<div class="file-chip">📄 ${a?escHtml(a.titulo):''} — ${escHtml(s.archivo)} ${badge(s.late?{key:'tarde',label:'Tardía'}:{key:'presentado',label:'A tiempo'})} ${gradeBadge(s)}${s.feedback?`<br><small>💬 ${escHtml(s.feedback)}</small>`:''}</div>`;}).join('')||'<div class="empty">Sin trabajos.</div>'}</div>`:''}`;
+  ${!isDoc?`<div class="card"><h3>📊 Mi progreso</h3><p class="desc">${subs.filter(s=>!s.manual).length} trabajos presentados · ${subs.filter(s=>gradeOf(s)!=null).length} calificados · ⭐ Promedio: <b>${prom}</b> · Grado ${session.grado||'—'} · Sección ${session.seccion||'—'}.</p>${subs.map(s=>{const a=store().activities.find(x=>x.id===s.activityId);return `<div class="file-chip">📄 ${a?escHtml(a.titulo):''} — ${s.manual?'(sin entrega)':''} ${badge(s.manual?{key:'entregam',label:'Sin entrega'}:(s.late?{key:'tarde',label:'Tardía'}:{key:'presentado',label:'A tiempo'}))} ${gradeBadge(s)}${s.feedback?`<br><small>💬 ${escHtml(s.feedback)}</small>`:''}</div>`;}).join('')||'<div class="empty">Sin trabajos.</div>'}</div>`:''}`;
 }
 function viewConfig(){
   const c=store().config||{};
