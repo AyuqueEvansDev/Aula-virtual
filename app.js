@@ -2323,11 +2323,12 @@ function viewDashDocente(){
     return true;
   });
   const total=activities.length;
-  const recibidas=new Set(liveSubs.map(s=>s.email)).size;
-  // Pendientes: solo cuenta estudiantes del grado de cada actividad publicada
-  const cuotaGrados=activities.filter(a=>a.estado==='publicada')
-    .reduce((acc,a)=>acc+((a.grado)?getAllStudents().filter(st=>!st.grado||gradoDigito(st.grado)===gradoDigito(a.grado)).length:getAllStudents().length),0);
-  const pendientes=Math.max(0, cuotaGrados-recibidas);
+  // Trabajos recibidos: cuenta TODOS los trabajos entregados vigentes
+  // (incluye reenvíos y copias de grupo), se refresca en cada render.
+  const recibidas=liveSubs.length;
+  // Pendientes de revisar: trabajos entregados que aún no tienen nota
+  // (disminuye automáticamente al calificar o quitar notas).
+  const pendientes=liveSubs.filter(s=>gradeOf(s)==null).length;
   const publicadas=activities.filter(a=>a.estado==='publicada').length;
   const recientes=[...activities].slice(-4).reverse();
   if(total===0){
