@@ -56,6 +56,17 @@ async function uploadFileToSupabase(bucket, path, file){
 async function supaRemove(bucket, paths){
   try { if(supa && paths && paths.length) await supa.storage.from(bucket).remove(paths); } catch(e){}
 }
+/* Archivos de Supabase que pueden borrarse sin romper a nadie:
+   los grupos comparten el MISMO storagePath (el del líder), así que
+   antes de borrar se verifica que ninguna entrega vigente lo use.
+   Además deduplica rutas para no enviar borrados repetidos. */
+function unusedStoragePaths(deletedSubs, remainingSubs){
+  const used = new Set();
+  (remainingSubs||[]).forEach(s=>{ if(s && s.storagePath) used.add(s.storagePath); });
+  const paths = new Set();
+  (deletedSubs||[]).forEach(s=>{ const p = s && s.storagePath; if(p && !used.has(p)) paths.add(p); });
+  return [...paths];
+}
 let routeParam = null;
 let entregaFilter = 'todos';
 let entregaSearch = '';
@@ -91,6 +102,18 @@ function allowedModulesFor(u){
 function canAccessModule(cid){
   if(!cid || !COURSES[cid]) return true; // legacy u otros: se permite (migración)
   return allowedModulesFor(session).includes(cid);
+}
+/* Integrantes válidos para grupos según el módulo de la actividad:
+   - Móviles: solo estudiantes de 4.° (cualquier sección).
+   - Ensamblaje (Mantenimiento y Reparación de Computadoras): solo 5.° A/B.
+   - Otros/legacy: sin restricción. */
+function groupEligibleFor(stu, curso){
+  const g = (stu.grado || '').trim();
+  const s = (stu.seccion || '').trim().toUpperCase();
+  if(!g && !s) return true; // sin ficha completa: no se puede filtrar
+  if(curso === 'moviles') return /^4/.test(g);
+  if(curso === 'ensamblaje') return /^5/.test(g) && (s === 'A' || s === 'B');
+  return true;
 }
 /* Filtro por grado de la actividad: si la actividad tiene grado asignado,
    solo la ven los estudiantes de ese grado (publicada/nuevo aviso/listado). */
@@ -234,12 +257,12 @@ function statusForStudent(a, sub){
     return sub.late ? {key:'tarde', label:'Fuera de plazo'} : {key:'presentado', label:'Presentado'};
   }
   const diff = deadlineOf(a) - new Date();
-  if(diff < 0) return {key:'vencido', label:'Vencido'};
+  if(diff < 0) return a.permitirTarde ? {key:'tarde_ok', label:'Puede entregar tarde'} : {key:'vencido', label:'Vencido'};
   return {key:'pendiente', label:'Pendiente'};
 }
 function badge(st){
-  const map={presentado:'b-green',vencido:'b-red',pendiente:'b-blue',tarde:'b-red',borrador:'b-gray',publicada:'b-green',revisar:'b-yellow',entregam:'b-yellow'};
-  const dot={presentado:'🟢',vencido:'🔴',pendiente:'🔵',tarde:'⚠️',borrador:'📝',publicada:'🟢',revisar:'🟡',entregam:'📝'};
+  const map={presentado:'b-green',vencido:'b-red',pendiente:'b-blue',tarde:'b-red',tarde_ok:'b-blue',borrador:'b-gray',publicada:'b-green',revisar:'b-yellow',entregam:'b-yellow'};
+  const dot={presentado:'🟢',vencido:'🔴',pendiente:'🔵',tarde:'⚠️',tarde_ok:'🟡',borrador:'📝',publicada:'🟢',revisar:'🟡',entregam:'📝'};
   return `<span class="badge ${map[st.key]||'b-gray'}"><span class="dot"></span>${dot[st.key]||''} ${st.label}</span>`;
 }
 /* ---------- Calificaciones reales (0-20) ---------- */
@@ -826,11 +849,12 @@ async function cleanupOrphanedCloudData(validIds, deletedIds){
     try {
       const snap = await db.collection('submissions').where('activityId', '==', aid).get();
       if(snap.empty) return;
-      const paths = [];
-      snap.forEach(doc => { try { const dd = doc.data() || {}; if(dd.storagePath) paths.push(dd.storagePath); } catch(e){} });
+      const docs = [];
+      snap.forEach(doc => { try { const dd = doc.data() || {}; docs.push(dd); } catch(e){} });
       await Promise.allSettled(snap.docs.map(x => cloudDelete('submissions', x.id)));
       cleaned++;
-      if(paths.length) supaRemove(SUPA_BUCKET, paths);
+      const wpaths = unusedStoragePaths(docs, []);
+      if(wpaths.length) supaRemove(SUPA_BUCKET, wpaths);
     } catch(e){ console.warn('cleanup subs:', aid, e); }
   }
   async function deleteGradesByAid(aid){
@@ -854,11 +878,12 @@ async function cleanupOrphanedCloudData(validIds, deletedIds){
       const allS = await db.collection('submissions').get();
       const dead = allS.docs.filter(x => { const a = (x.data() || {}).activityId || ''; return a && !valid.has(a) && !del.has(a); });
       if(dead.length){
-        const paths = [];
-        dead.forEach(x => { try { const dd = x.data() || {}; if(dd.storagePath) paths.push(dd.storagePath); } catch(e){} });
+        const deadDocs = dead.map(x => x.data() || {});
+        const otherDocs = allS.docs.filter(x => !dead.includes(x)).map(x => x.data() || {});
         await Promise.allSettled(dead.map(x => cloudDelete('submissions', x.id)));
         cleaned++;
-        if(paths.length) supaRemove(SUPA_BUCKET, paths);
+        const wpaths = unusedStoragePaths(deadDocs, otherDocs);
+        if(wpaths.length) supaRemove(SUPA_BUCKET, wpaths);
       }
     } catch(e){ console.warn('scan submissions:', e); }
     try {
@@ -992,7 +1017,17 @@ function pendingActivityBanner(){
   try { unread = myUnreadActivityNotifs(); } catch(e){ unread = []; }
   if(!unread.length) return '';
   const n = unread[0];
-  return `<div class="alert alert-blue">📚 <b>Nueva actividad publicada:</b> ${escHtml(n.activityTitle)} · ${escHtml(courseOf(n.module).corto || '')}${n.limite?` · ⏰ ${fmtFecha(n.limite)}`:''} <button class="btn btn-primary btn-sm" onclick="navigate('actividad','${n.activityId}')">Ver ahora →</button>${unread.length>1?` <small>(+${unread.length-1} más)</small>`:''}</div>`;
+  return `<div class="alert alert-blue" style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+    <div style="flex:1;min-width:230px">
+      <div style="font-weight:800;font-size:15px;margin-bottom:3px">📚 Nueva actividad publicada</div>
+      <div style="font-size:15px"><b>${escHtml(n.activityTitle)}</b></div>
+      <div style="font-size:13px;color:#475569;margin-top:3px">${escHtml(courseOf(n.module).corto || '')}${n.limite?` · ⏰ ${fmtFecha(n.limite)}`:''}</div>
+    </div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px">
+      <button class="btn btn-primary btn-sm" style="white-space:nowrap" onclick="navigate('actividad','${n.activityId}')">Ver ahora →</button>
+      ${unread.length>1?`<small style="color:#475569">＋${unread.length-1} más pendientes</small>`:''}
+    </div>
+  </div>`;
 }
 function toast(msg){ const t=document.getElementById('toast'); t.textContent=msg; t.classList.add('show'); setTimeout(()=>t.classList.remove('show'),2600); }
 /* ============================================================
@@ -1774,6 +1809,7 @@ async function pullSubmissionsFromCloud(){
     if(session.rol==='docente' && db && !dedupeSubmissions._cloudPurged){
       dedupeSubmissions._cloudPurged = true;
       dd.stale.forEach(x=>{ if(x.id) cloudDelete('submissions', x.id); });
+      try { const oldPaths = unusedStoragePaths(dd.stale, dd.list); if(oldPaths.length) supaRemove(SUPA_BUCKET, oldPaths); } catch(e){}
     }
     changed++;
   }
@@ -1810,6 +1846,7 @@ function dedupeSubmissions(purgeCloud){
     try{ saveStore(d); }catch(e){}
     if(purgeCloud && db){
       stale.forEach(x=>{ if(x.id) cloudDelete('submissions', x.id); });
+      try { const oldPaths = unusedStoragePaths(stale, list); if(oldPaths.length) supaRemove(SUPA_BUCKET, oldPaths); } catch(e){}
     }
     return stale.length;
   }catch(e){ return 0; }
@@ -2705,10 +2742,11 @@ async function delActivity(id){
       } catch(e){ console.warn('Limpieza grade_notifs:', e); }
     }
   } catch(e){ console.warn('delActivity nube:', e); }
-  // Borra archivos de Supabase (mejor esfuerzo, no bloquea)
+  // Borra archivos de Supabase (mejor esfuerzo, no bloquea).
+  // Se deduplica: los integrantes del grupo comparten el mismo archivo.
   try{
     if(act?.materialPath) supaRemove(SUPA_BUCKET, [act.materialPath]);
-    const wpaths = subs.map(s=>s.storagePath).filter(Boolean);
+    const wpaths = unusedStoragePaths(subs, []);
     if(wpaths.length) supaRemove(SUPA_BUCKET, wpaths);
   }catch(e){}
   toast('🗑 Actividad y sus notificaciones eliminadas');
@@ -2740,13 +2778,7 @@ function viewActividadEst(id){
   const esMiembroGrupo = !!(sub && sub.grupo && !sub.grupoLider);
   const liderGrupo = esMiembroGrupo ? (store().submissions.find(x=>x.activityId===id && x.grupoLider && ((x.integrantes||[]).includes(sub.email)))?.estudiante || sub.grupoNombre || 'un integrante') : '';
   const isGroupMode = a.grupo && !esMiembroGrupo && (!sub || sub.grupoLider || !sub.grupo);
-  const classmates = a.grupo ? getAllStudents().filter(stu=>{
-    if(stu.email===session.email) return false;
-    if(session.grado && session.seccion){
-      if(stu.grado && stu.seccion) return stu.grado===session.grado && stu.seccion===session.seccion;
-    }
-    return true;
-  }) : [];
+  const classmates = a.grupo ? getAllStudents().filter(stu=>stu.email && stu.email!==session.email && groupEligibleFor(stu,a.curso)) : [];
   let countHtml = sub && sub.manual ? `<div class="alert alert-yellow">📝 El docente registró una calificación <b>sin entrega</b> para esta actividad.</div>`
     : sub ? `<div class="alert alert-green">✓ Presentado ${sub.late?'fuera de plazo':'a tiempo'} · ${fmtFechaHora(sub.fecha)}</div>`
     : vencida ? `<div class="countdown" style="background:linear-gradient(135deg,#fee2e2,#fecaca);border-color:#fca5a5"><b style="font-size:20px;color:#dc2626">⚠️ Actividad vencida</b><br><small>Ya no se aceptan trabajos<br>Límite: ${fmtFecha(a.limite)} · ${fmtHora12(a.hora)}</small></div>`
@@ -2778,15 +2810,27 @@ function viewActividadEst(id){
     <div class="alert alert-blue">🧑‍🤝‍🧑 Actividad <b>en grupo</b>: un solo integrante envía el archivo y el docente califica a todo el grupo.</div>
     <div class="form-grid">
       <div class="field"><label>👥 Nombre del grupo</label><input id="gName" placeholder="Ej. Los Innovadores"></div>
-      <div class="field"><label>👥 Correos extra (opcional, separados por coma)</label><input id="gExtra" placeholder="correo personal del compañero, otro@correo.com"></div>
     </div>
     <div class="field"><label>👥 Integrantes (además de ti)</label>
-      <div id="groupMembers" style="font-size:13.5px;max-height:180px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:10px">
-        ${classmates.map(c=>`<label style="display:block;cursor:pointer"><input type="checkbox" style="accent-color:var(--primary)" value="${escHtml(c.email)}"> ${escHtml(c.nombre)}${c.grado||c.seccion?` <small style="color:#64748b">(${escHtml([c.grado,c.seccion].filter(Boolean).join(' · '))})</small>`:''}</label>`).join('')||'<small style="color:#64748b">No hay compañeros registrados en tu clase todavía. Puedes escribir sus correos arriba.</small>'}
+      <div id="groupMembers" style="font-size:15px;max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:10px;padding:10px">
+        ${(()=>{
+          const gruposMap = new Map();
+          classmates.forEach(c=>{
+            const k = [c.grado||'Sin grado', c.seccion].filter(Boolean).join(' · ');
+            if(!gruposMap.has(k)) gruposMap.set(k, []);
+            gruposMap.get(k).push(c);
+          });
+          const keys = [...gruposMap.keys()].sort((x,y)=>x.localeCompare(y,'es'));
+          return keys.map(k=>`
+            <div style="margin-bottom:8px">
+              <div style="font-size:14px;font-weight:700;color:#475569;margin:4px 0 2px">🎓 ${escHtml(k)}</div>
+              ${gruposMap.get(k).map(c=>`<label style="display:block;cursor:pointer;padding:2px 0"><input type="checkbox" style="accent-color:var(--primary)" value="${escHtml(c.email)}"> ${escHtml(c.nombre)}</label>`).join('')}
+            </div>`).join('')||'<small style="color:#64748b">No hay compañeros registrados todavía.</small>';
+        })()}
       </div>
     </div>`:''}
     <div class="dropzone" id="dz" onclick="document.getElementById('fileIn').click()" ondragover="event.preventDefault();this.classList.add('over')" ondragleave="event.preventDefault();this.classList.remove('over')" ondrop="dropFiles(event)">
-      📁 Arrastra y suelta tus archivos aquí<br><small>o haz clic para seleccionar · Permitidos: ${a.tipos} · Máx. 10 MB por archivo</small>
+      📁 Arrastra tus archivos o haz clic para seleccionarlos. PDF, DOCX o PPTX · Máx. 5MB por archivo.
       <input type="file" id="fileIn" ${a.multiple?'multiple':''} style="display:none" onchange="pickFiles(this)">
     </div>
     <div id="fileList"></div>
@@ -2833,9 +2877,6 @@ async function submitWork(activityId){
         const v=(c.value||'').trim().toLowerCase(); if(v) emails.add(v);
       });
     } catch(e){}
-    (document.getElementById('gExtra')?.value||'').split(/[,;\s]+/).forEach(x=>{
-      const v=x.trim().toLowerCase(); if(v && v.includes('@')) emails.add(v);
-    });
     if(emails.size>1) grupoData = { grupoNombre:gName||('Grupo de '+firstName()), integrantes:[...emails] };
   }
   const meKey=(session.email||'').toLowerCase();
@@ -2892,6 +2933,8 @@ async function submitWork(activityId){
   // La nube manda limpiar los registros reemplazados (sin duplicados)
   if(db && prevList.length){
     try { await Promise.all(prevList.filter(p=>p.id).map(p=>cloudDelete('submissions', p.id))); } catch(e){}
+    // El archivo anterior ya no lo usa nadie: fuera de Supabase (mejor esfuerzo)
+    try { const oldPaths = unusedStoragePaths(prevList, d.submissions); if(oldPaths.length) supaRemove(SUPA_BUCKET, oldPaths); } catch(e){}
   }
   // NUBE PRIMERO para entregas: el docente las ve en cualquier dispositivo.
   let cloudOkCount = 0;
@@ -3078,7 +3121,7 @@ function entregaRowsFor(sel){
       if(s.manual){ estado={key:'entregam',label:'Calificado (sin entrega)'}; fecha=fmtFechaHora(s.fecha); arch=''; }
       else { estado=s.late?{key:'tarde',label:'Fuera de plazo'}:{key:'presentado',label:'Presentado'}; fecha=fmtFechaHora(s.fecha); arch=s.archivo; }
     }
-    else { estado=(a&&new Date()>deadlineOf(a))?{key:'vencido',label:'Vencido'}:{key:'pendiente',label:'Pendiente'}; }
+    else { estado=(a&&new Date()>deadlineOf(a))?(a.permitirTarde?{key:'tarde_ok',label:'Puede entregar tarde'}:{key:'vencido',label:'Vencido'}):{key:'pendiente',label:'Pendiente'}; }
     return {st,s,estado,fecha,arch};
   }).filter(r=>{
     if(q && !(r.st.nombre||'').toLowerCase().includes(q) && !(r.st.email||'').toLowerCase().includes(q)) return false;
@@ -3354,11 +3397,16 @@ async function confirmDeleteStudent(email){
     const rest=arr.filter(u=>(u.email||'').toLowerCase()!==mail);
     localStorage.setItem(key, JSON.stringify(rest));
   }catch(e){}
-  // 2) Entregas (local + nube)
+  // 2) Entregas (local + nube).
+  //    En cascada: si el estudiante lideraba grupos, las copias de sus
+  //    integrantes también se eliminan (comparten el mismo archivo).
   const subs=d.submissions.filter(s=>(s.email||'').toLowerCase()===mail);
-  d.submissions=d.submissions.filter(s=>(s.email||'').toLowerCase()!==mail);
+  const groupCopies=d.submissions.filter(s=>!subs.includes(s) && s.grupo && !s.grupoLider && integrantesDeGrupo(s).includes(mail));
+  d.submissions=d.submissions.filter(s=>(s.email||'').toLowerCase()!==mail && !groupCopies.includes(s));
   saveStore(d);
-  for(const s of subs){ try{ await cloudDelete('submissions', s.id); }catch(e){} }
+  for(const s of subs.concat(groupCopies)){ try{ await cloudDelete('submissions', s.id); }catch(e){} }
+  // El archivo físico solo se borra si ninguna entrega vigente lo sigue usando
+  try { const oldPaths = unusedStoragePaths(subs.concat(groupCopies), d.submissions); if(oldPaths.length) supaRemove(SUPA_BUCKET, oldPaths); } catch(e){}
   // 3) Calificaciones y avisos del estudiante (local + nube)
   try{
     const garr=getGradeNotifs().filter(n=>(n.studentEmail||'').toLowerCase()!==mail);
